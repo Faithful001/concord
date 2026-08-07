@@ -4,6 +4,7 @@ func (n *Node) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	// Stale leader, ignore it.
 	if args.Term < n.currentTerm {
 		return &AppendEntriesReply{
 			Term:    n.currentTerm,
@@ -16,14 +17,12 @@ func (n *Node) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 		n.votedFor = ""
 	}
 
-	// reset the clock for the election timeout timer
 	// n.resetElectionTimeout()
 
-	// set the role to follower
 	n.role = Follower
 
-	//check if this is the first log entry we're about to make, i.e: args.PrevLogIndex == 0
-	if args.PrevLogIndex == 0 {
+	// PrevLogIndex == 0 means there's nothing before this to check against.
+	if args.PrevLogIndex > 0 {
 		term, ok := n.termAt(args.PrevLogIndex)
 
 		if !ok || term != args.PrevLogTerm {
@@ -34,26 +33,22 @@ func (n *Node) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 		}
 	}
 
-	// append new entries
 	for _, entry := range args.Entries {
 		existingTerm, ok := n.termAt(entry.Index)
 		switch {
 		case ok && existingTerm != entry.Term:
-			// Conflict: cut the log at this point and take the leader's version.
+			// Our log disagrees with the leader here, toss it and take theirs.
 			n.log = n.log[:entry.Index-1]
 			n.log = append(n.log, entry)
 		case !ok:
-			// We don't have this entry yet, so just append it.
+			// New to us, just add it.
 			n.log = append(n.log, entry)
 		default:
-			// ok && existingTerm == entry.Term: we already have this exact
-			// entry, nothing to do.
+			// Already have this one, nothing to do.
 		}
 	}
 
-	// advance our commitIndex if the leader has committed further
-	// than we have. Cap it at the index of the last new entry, in case we
-	// haven't actually received everything the leader has committed yet.
+	// Don't commit past what we've actually received.
 	if args.LeaderCommitIndex > n.commitIndex {
 		lastNewIndex := args.PrevLogIndex + len(args.Entries)
 		if args.LeaderCommitIndex < lastNewIndex {
@@ -67,11 +62,12 @@ func (n *Node) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 		Term:    n.currentTerm,
 		Success: true,
 	}
-
 }
 
+// termAt returns the term at a given 1-based log index, and whether that
+// entry exists at all.
 func (n *Node) termAt(index int) (int, bool) {
-	if index < 0 || index > len(n.log) {
+	if index < 1 || index > len(n.log) {
 		return 0, false
 	}
 

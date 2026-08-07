@@ -1,10 +1,12 @@
 package raft
 
+import "sync"
+
 func (n *Node) RequestVote(args *RequestVoteArgs) *RequestVoteReply {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	// Rule 1: reject outright if the candidate's term is stale.
+	// Stale request, ignore it.
 	if args.Term < n.currentTerm {
 		return &RequestVoteReply{
 			Term:        n.currentTerm,
@@ -12,27 +14,19 @@ func (n *Node) RequestVote(args *RequestVoteArgs) *RequestVoteReply {
 		}
 	}
 
-	// Rule 2: if the candidate's term is newer, we're behind. Step down to
-	// Follower and reset our vote for this new term. Note: commitIndex,
-	// lastApplied, nextIndex, and matchIndex are NOT touched here, they
-	// track our own local replication progress, which this RPC has no
-	// bearing on.
+	// They're ahead of us, catch up and reset our vote.
 	if args.Term > n.currentTerm {
 		n.currentTerm = args.Term
 		n.role = Follower
 		n.votedFor = ""
 	}
 
-	// Rule 3: check whether the candidate's log is at least as up-to-date
-	// as ours. Compare LastLogTerm first, a higher term means more recent
-	// data regardless of index. Only if terms are equal do we fall back to
-	// comparing index, the longer log wins.
+	// Their log needs to be at least as up to date as ours, term first,
+	// then index as a tiebreaker.
 	lastIndex, lastTerm := n.lastLogIndexAndTerm()
 	candidateLogIsUpToDate := args.LastLogTerm > lastTerm ||
 		(args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIndex)
 
-	// Rule 4: grant the vote only if we haven't voted this term (or already
-	// voted for this exact candidate) AND their log qualifies under Rule 3.
 	voteGranted := false
 	if (n.votedFor == "" || n.votedFor == args.CandidateID) && candidateLogIsUpToDate {
 		n.votedFor = args.CandidateID
@@ -46,8 +40,99 @@ func (n *Node) RequestVote(args *RequestVoteArgs) *RequestVoteReply {
 	}
 }
 
-// lastLogIndexAndTerm returns the index and term of the last entry in this
-// node's log, or (0, 0) if the log is empty.
+// TODO: update to real transport
+type Transport interface {
+	SendRequestVote(peer string, args *RequestVoteArgs) (*RequestVoteReply, error)
+}
+
+// startElection makes this node a Candidate, asks everyone for a vote, and
+// becomes Leader if it gets a majority.
+func (n *Node) startElection(transport Transport) {
+	n.mu.Lock()
+
+	n.currentTerm++
+	n.role = Candidate
+	n.votedFor = n.id
+	electionTerm := n.currentTerm
+	lastIndex, lastTerm := n.lastLogIndexAndTerm()
+	candidateID := n.id
+	peers := n.peers
+
+	n.mu.Unlock()
+
+	// TODO: reset election timer here once it exists.
+
+	votes := 1 // we vote for ourselves
+	var votesMu sync.Mutex
+	var wg sync.WaitGroup
+
+	for _, peer := range peers {
+		wg.Add(1)
+		go func(peer string) {
+			defer wg.Done()
+
+			reply, err := transport.SendRequestVote(peer, &RequestVoteArgs{
+				Term:         electionTerm,
+				CandidateID:  candidateID,
+				LastLogIndex: lastIndex,
+				LastLogTerm:  lastTerm,
+			})
+			if err != nil {
+				// Couldn't reach them, no vote either way.
+				return
+			}
+
+			n.mu.Lock()
+			defer n.mu.Unlock()
+
+			// Something changed while we were waiting, this reply is old news.
+			if n.currentTerm != electionTerm || n.role != Candidate {
+				return
+			}
+
+			// They know about a later term than us, back down.
+			if reply.Term > n.currentTerm {
+				n.currentTerm = reply.Term
+				n.role = Follower
+				n.votedFor = ""
+				return
+			}
+
+			if reply.VoteGranted {
+				votesMu.Lock()
+				votes++
+				wonMajority := votes*2 > len(peers)+1
+				votesMu.Unlock()
+
+				if wonMajority && n.role == Candidate {
+					n.becomeLeader()
+				}
+			}
+		}(peer)
+	}
+
+	wg.Wait()
+}
+
+// becomeLeader switches this node into Leader mode and sets up the
+// per-peer tracking a leader needs. Caller must already hold n.mu.
+func (n *Node) becomeLeader() {
+	n.role = Leader
+	n.nextIndex = make(map[string]int)
+	n.matchIndex = make(map[string]int)
+
+	lastIndex, _ := n.lastLogIndexAndTerm()
+	for _, peer := range n.peers {
+		n.nextIndex[peer] = lastIndex + 1
+		n.matchIndex[peer] = 0
+	}
+
+	// TODO: start sending heartbeats, and keep sending them on an interval
+	// for as long as we're leader.
+}
+
+// lastLogIndexAndTerm returns the index and term of our last log entry,
+// or (0, 0) if the log's empty.
 func (n *Node) lastLogIndexAndTerm() (int, int) {
 	if len(n.log) == 0 {
 		return 0, 0
