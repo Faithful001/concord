@@ -17,7 +17,7 @@ func (n *Node) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 		n.votedFor = ""
 	}
 
-	// n.resetElectionTimeout()
+	n.resetElectionTimeout()
 
 	n.role = Follower
 

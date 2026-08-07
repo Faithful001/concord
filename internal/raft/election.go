@@ -1,6 +1,8 @@
 package raft
 
-import "sync"
+import (
+	"sync"
+)
 
 func (n *Node) RequestVote(args *RequestVoteArgs) *RequestVoteReply {
 	n.mu.Lock()
@@ -60,7 +62,7 @@ func (n *Node) startElection(transport Transport) {
 
 	n.mu.Unlock()
 
-	// TODO: reset election timer here once it exists.
+	n.resetElectionTimeout()
 
 	votes := 1 // we vote for ourselves
 	var votesMu sync.Mutex
@@ -85,12 +87,10 @@ func (n *Node) startElection(transport Transport) {
 			n.mu.Lock()
 			defer n.mu.Unlock()
 
-			// Something changed while we were waiting, this reply is old news.
 			if n.currentTerm != electionTerm || n.role != Candidate {
 				return
 			}
 
-			// They know about a later term than us, back down.
 			if reply.Term > n.currentTerm {
 				n.currentTerm = reply.Term
 				n.role = Follower
