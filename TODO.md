@@ -12,5 +12,19 @@ Right now AppendEntries has a commented-out line: n.resetElectionTimeout(). That
 [X] 4. Why the timeout must be randomized each time
 Randomization is what prevents every follower from timing out at the exact same moment and splitting the vote forever (this came up back when we first discussed leader election). Pick the timeout fresh, randomly, every single time the timer restarts — not once at startup.
 
-[] 5. Where the code goes
+[X] 5. Where the code goes
 Put this in internal/raft/election.go alongside startElection — it's part of the same concern (when and how a node decides to become a candidate).
+
+[] 6. Transport
+Implement a fake transport
+
+it should have a struct
+type MockTransport struct {
+nodes map[string]\*Node
+}
+
+Methods it should include:
+
+- Register(peerId string, node \*Node)
+- SendRequestVote(peerId string, args \*RequestVoteArgs)
+- SendAppendEntries(peerId string, args \*AppendEntriesArgs)

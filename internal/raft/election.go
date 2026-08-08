@@ -8,7 +8,6 @@ func (n *Node) RequestVote(args *RequestVoteArgs) *RequestVoteReply {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	// Stale request, ignore it.
 	if args.Term < n.currentTerm {
 		return &RequestVoteReply{
 			Term:        n.currentTerm,
@@ -16,15 +15,12 @@ func (n *Node) RequestVote(args *RequestVoteArgs) *RequestVoteReply {
 		}
 	}
 
-	// They're ahead of us, catch up and reset our vote.
 	if args.Term > n.currentTerm {
 		n.currentTerm = args.Term
 		n.role = Follower
 		n.votedFor = ""
 	}
 
-	// Their log needs to be at least as up to date as ours, term first,
-	// then index as a tiebreaker.
 	lastIndex, lastTerm := n.lastLogIndexAndTerm()
 	candidateLogIsUpToDate := args.LastLogTerm > lastTerm ||
 		(args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIndex)
@@ -47,8 +43,6 @@ type Transport interface {
 	SendRequestVote(peer string, args *RequestVoteArgs) (*RequestVoteReply, error)
 }
 
-// startElection makes this node a Candidate, asks everyone for a vote, and
-// becomes Leader if it gets a majority.
 func (n *Node) startElection(transport Transport) {
 	n.mu.Lock()
 
@@ -80,7 +74,6 @@ func (n *Node) startElection(transport Transport) {
 				LastLogTerm:  lastTerm,
 			})
 			if err != nil {
-				// Couldn't reach them, no vote either way.
 				return
 			}
 
@@ -114,8 +107,6 @@ func (n *Node) startElection(transport Transport) {
 	wg.Wait()
 }
 
-// becomeLeader switches this node into Leader mode and sets up the
-// per-peer tracking a leader needs. Caller must already hold n.mu.
 func (n *Node) becomeLeader() {
 	n.role = Leader
 	n.nextIndex = make(map[string]int)
