@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"log"
 	"math/rand"
 	"sync"
 	"time"
@@ -75,6 +76,8 @@ func (n *Node) electionTimerLoop() {
 			n.mu.Lock()
 			role := n.role
 			n.mu.Unlock()
+
+			log.Printf("[%s] election timeout fired", n.id)
 
 			if role != Leader {
 				n.startElection(n.transport)

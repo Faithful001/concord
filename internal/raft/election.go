@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"log"
 	"sync"
 )
 
@@ -32,6 +33,8 @@ func (n *Node) RequestVote(args *RequestVoteArgs) *RequestVoteReply {
 		voteGranted = true
 	}
 
+	log.Printf("[%s] vote for %s in term %d: %v", n.id, args.CandidateID, args.Term, voteGranted)
+
 	return &RequestVoteReply{
 		Term:        n.currentTerm,
 		VoteGranted: voteGranted,
@@ -48,6 +51,7 @@ func (n *Node) startElection(transport Transport) {
 
 	n.currentTerm++
 	n.role = Candidate
+	log.Printf("[%s] starting election for term %d", n.id, n.currentTerm)
 	n.votedFor = n.id
 	electionTerm := n.currentTerm
 	lastIndex, lastTerm := n.lastLogIndexAndTerm()
@@ -109,6 +113,7 @@ func (n *Node) startElection(transport Transport) {
 
 func (n *Node) becomeLeader() {
 	n.role = Leader
+	log.Printf("[%s] became leader for term %d", n.id, n.currentTerm)
 	n.nextIndex = make(map[string]int)
 	n.matchIndex = make(map[string]int)
 
