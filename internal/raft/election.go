@@ -2,7 +2,9 @@ package raft
 
 import (
 	"log"
+	"math/rand"
 	"sync"
+	"time"
 )
 
 func (n *Node) RequestVote(args *RequestVoteArgs) *RequestVoteReply {
@@ -41,9 +43,9 @@ func (n *Node) RequestVote(args *RequestVoteArgs) *RequestVoteReply {
 	}
 }
 
-// TODO: update to real transport
 type Transport interface {
 	SendRequestVote(peer string, args *RequestVoteArgs) (*RequestVoteReply, error)
+	SendAppendEntries(peer string, args *AppendEntriesArgs) (*AppendEntriesReply, error)
 }
 
 func (n *Node) startElection(transport Transport) {
@@ -123,8 +125,54 @@ func (n *Node) becomeLeader() {
 		n.matchIndex[peer] = 0
 	}
 
-	// TODO: start sending heartbeats, and keep sending them on an interval
-	// for as long as we're leader.
+	go n.sendHeartbeats(n.currentTerm)
+}
+
+func (n *Node) sendHeartbeats(leaderTerm int) {
+	ticker := time.NewTicker(randomHeartbeatInterval())
+	defer ticker.Stop()
+
+	for range ticker.C {
+		n.mu.Lock()
+		if n.role != Leader || n.currentTerm != leaderTerm {
+			n.mu.Unlock()
+			return
+		}
+		peers := n.peers
+		leaderID := n.id
+		commitIndex := n.commitIndex
+		transport := n.transport
+		n.mu.Unlock()
+
+		for _, peer := range peers {
+			go func(peer string) {
+				reply, err := transport.SendAppendEntries(peer, &AppendEntriesArgs{
+					Term:              leaderTerm,
+					LeaderID:          leaderID,
+					PrevLogIndex:      0,
+					PrevLogTerm:       0,
+					Entries:           []LogEntry{},
+					LeaderCommitIndex: commitIndex,
+				})
+				if err != nil {
+					return
+				}
+
+				n.mu.Lock()
+				defer n.mu.Unlock()
+
+				if reply.Term > n.currentTerm {
+					n.currentTerm = reply.Term
+					n.role = Follower
+					n.votedFor = ""
+				}
+			}(peer)
+		}
+	}
+}
+
+func randomHeartbeatInterval() time.Duration {
+	return time.Duration(50+rand.Intn(51)) * time.Millisecond // 50–100ms
 }
 
 // lastLogIndexAndTerm returns the index and term of our last log entry,

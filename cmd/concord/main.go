@@ -1,59 +1,48 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
-	"time"
+	"strings"
 
 	"github.com/Faithful001/concord.git/internal/raft"
+	"github.com/Faithful001/concord.git/internal/transport"
 )
 
 func main() {
-	// create the mock nodes
-	peerIds := []string{"node-1", "node-2", "node-3"}
+	id := flag.String("id", "", "this node's ID")
+	addr := flag.String("addr", "", "address to listen on, e.g. localhost:8001")
+	peersFlag := flag.String("peers", "", "comma-separated id=addr pairs, e.g. node-2=localhost:8002,node-3=localhost:8003")
+	flag.Parse()
 
-	// instantiate the transport
-	transport := raft.NewMockTransport()
-
-	nodes := make(map[string]*raft.Node)
-
-	for _, id := range peerIds {
-		nodes[id] = raft.NewNode(id, otherIds(peerIds, id), transport)
+	if *id == "" || *addr == "" {
+		log.Fatal("both -id and -addr are required")
 	}
-	
 
-	// register each node
-	for id, node := range nodes {
-		if err := transport.Register(id, node); err != nil {
-			log.Fatalf("failed to register node %s: %v", id, err)
+	addresses := make(map[string]string) // id -> address
+	
+	var peerIDs []string
+	
+	if *peersFlag != "" {
+		for _, pair := range strings.Split(*peersFlag, ",") {
+			parts := strings.SplitN(pair, "=", 2)
+			addresses[parts[0]] = parts[1]
+			peerIDs = append(peerIDs, parts[0])
 		}
-
-		log.Printf("node %s registered", id)
 	}
 
-	// start each node
-	for id, node := range nodes {
-		node.Start()
-		log.Printf("node %s started", id)
-	}
+	rpcTransport := transport.NewRPCTransport(addresses)
+	node := raft.NewNode(*id, peerIDs, rpcTransport)
 
-	// wait for 10 seconds
-	time.Sleep(10 * time.Second)
+	go func() {
+		fmt.Printf("[%s] listening on %s\n", *id, *addr)
+		if err := transport.Serve(node, *addr); err != nil {
+			log.Fatalf("serve failed: %v", err)
+		}
+	}()
 
-	fmt.Println("stopping cluster")
-	for _, node := range nodes {
-		node.Stop()
-	}
-}
+	node.Start()
 
-func otherIds(allIds []string, excludeId string) []string {
-	var result []string
-	
-	for _, id := range allIds {
-		if id != excludeId {
-			result = append(result, id)
-		}	
-	}
-
-	return result
+	select {} // block forever
 }
