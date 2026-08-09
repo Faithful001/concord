@@ -11,7 +11,7 @@ type RPCTransport struct {
 	addresses map[string]string // peer ID -> "host:port"
 
 	mu      sync.Mutex
-	clients map[string]*rpc.Client // peer ID -> live connection, if any
+	clients map[string]*rpc.Client // peer ID -> live connection (one client per peer)
 }
 
 func NewRPCTransport(addresses map[string]string) *RPCTransport {
