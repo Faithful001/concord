@@ -4,8 +4,6 @@ A distributed key-value store built on Raft consensus, providing strong consiste
 
 Concord replicates data across multiple machines and keeps working correctly even when some of them crash or the network between them misbehaves. It implements the [Raft consensus algorithm](https://raft.github.io/raft.pdf) from scratch: leader election, log replication, and safety, as the foundation for a small, understandable distributed KV store, in the spirit of systems like etcd.
 
-This project is being built as a learning exercise in distributed systems, and this README tracks both what's actually implemented today and where the project is headed.
-
 ---
 
 ## Table of Contents
