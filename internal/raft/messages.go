@@ -14,8 +14,7 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-// AppendEntriesArgs is sent by the leader, both to replicate log entries
-// and as a heartbeat (empty Entries) to maintain authority.
+// AppendEntriesArgs is sent by the leader to replicate log entries or send heartbeats.
 type AppendEntriesArgs struct {
 	Term         		int
 	LeaderID     		string

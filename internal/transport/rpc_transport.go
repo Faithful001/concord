@@ -30,7 +30,8 @@ func (t *RPCTransport) getClient(peer string) (*rpc.Client, error) {
 		return client, nil
 	}
 
-	/// since we don't have a connection to this peer, we need to dial a new one
+	//// since we don't have a connection to this peer, we need to dial a new one
+	
 	// get the address of the peer
 	addr, ok := t.addresses[peer]
 	if !ok {
@@ -80,6 +81,7 @@ func (t *RPCTransport) SendAppendEntries(peer string, args *raft.AppendEntriesAr
 
 	var reply raft.AppendEntriesReply
 	if err := client.Call("RPCService.AppendEntries", args, &reply); err != nil {
+		// if the connection is dead, drop it
 		t.dropClient(peer)
 		return nil, err
 	}

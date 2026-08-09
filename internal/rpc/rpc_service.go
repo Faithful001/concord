@@ -2,10 +2,7 @@ package rpc
 
 import "github.com/Faithful001/concord.git/internal/raft"
 
-// This is the adapter layer
-// RPCService adapts Node's methods to the signature net/rpc requires:
-// func(args, *reply) error. Node's own methods return values directly,
-// which net/rpc can't call remotely.
+// RPCService adapts Node's direct-return methods to net/rpc's func(args, *reply) error signature.
 
 type RPCService struct {
 	node *raft.Node

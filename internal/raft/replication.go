@@ -57,8 +57,7 @@ func (n *Node) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 	}
 }
 
-// termAt returns the term on the given index of the Log, along with
-// whether that entry exists at all.
+// termAt returns the term at log index, and whether it exists.
 func (n *Node) termAt(index int) (int, bool) {
 	if index < 1 || index > len(n.log) {
 		return 0, false
