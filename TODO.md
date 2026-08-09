@@ -29,14 +29,14 @@
   - `SendRequestVote(peerId string, args *RequestVoteArgs)`
   - `SendAppendEntries(peerId string, args *AppendEntriesArgs)`
 
-  - [ ] **7. A heartbeat loop, started in becomeLeader**
-        Once a node calls becomeLeader, it needs a background goroutine that fires every ~50-100ms (well under the 150-300ms election timeout) for as long as this node remains leader. Each tick sends an AppendEntries to every peer, with an empty Entries slice for now (real log replication comes after this).
+- [x] **7. A heartbeat loop, started in becomeLeader**
+      Once a node calls becomeLeader, it needs a background goroutine that fires every ~50-100ms (well under the 150-300ms election timeout) for as long as this node remains leader. Each tick sends an AppendEntries to every peer, with an empty Entries slice for now (real log replication comes after this).
 
-  - [ ] **8. Stopping when no longer leader**
-        The heartbeat goroutine needs to know when to stop — specifically, the moment this node discovers a higher term and steps down to Follower (which already happens inside startElection's vote-counting code when reply.Term > n.currentTerm). A dedicated stop channel (separate from the node's overall stopCh) works well here.
+- [x] **8. Stopping when no longer leader**
+      The heartbeat goroutine needs to know when to stop — specifically, the moment this node discovers a higher term and steps down to Follower (which already happens inside startElection's vote-counting code when reply.Term > n.currentTerm). A dedicated stop channel (separate from the node's overall stopCh) works well here.
 
-  - [ ] **9. Wire SendAppendEntries into MockTransport**
-        AppendEntries needs to be added to your Transport/MockTransport, mirroring how SendRequestVote already works — route the call to the target node's AppendEntries method directly.
+- [x] **9. Wire SendAppendEntries into MockTransport**
+      AppendEntries needs to be added to your Transport/MockTransport, mirroring how SendRequestVote already works — route the call to the target node's AppendEntries method directly.
 
-  - [ ] **10. Add heartbeat logging to see it working**
-        With heartbeats running, add a log line each time a follower receives one (or each time a leader sends one) so you can watch the cluster settle into a stable state — one leader, two followers, heartbeats flowing, no more elections firing.
+- [x] **10. Add heartbeat logging to see it working**
+      With heartbeats running, add a log line each time a follower receives one (or each time a leader sends one) so you can watch the cluster settle into a stable state — one leader, two followers, heartbeats flowing, no more elections firing.

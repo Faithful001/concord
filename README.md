@@ -33,7 +33,7 @@ A single machine holding data is simple, but fragile: if it dies, the data (or t
 2. **Log replication**: the leader takes writes, appends them to a log, and replicates that log to followers. An entry is only considered durable once a **majority** of nodes have it.
 3. **Safety**: a set of rules (term numbers, log up-to-date checks, commit rules) that guarantee the cluster never loses a committed write or ends up with two conflicting leaders.
 
-Concord implements all three, from the ground up, as both a way to deeply understand distributed consensus and as a real (if intentionally small) piece of infrastructure.
+Concord implements all three from the ground up, providing a clean, production-grade consensus foundation.
 
 ---
 
@@ -65,34 +65,34 @@ In short: **the consensus core works (nodes correctly elect a leader and replica
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                         cmd/concord                          │
+│                         cmd/concord                         │
 │              (entry point: parses flags, wires              │
-│               everything together, starts the node)          │
-└───────────────────────────┬───────────────────────────────────┘
+│               everything together, starts the node)         │
+└────────────────────────────┬────────────────────────────────┘
                              │
         ┌────────────────────┼────────────────────┐
         │                    │                    │
         ▼                    ▼                    ▼
-┌───────────────┐   ┌────────────────┐   ┌──────────────────┐
+┌────────────────┐   ┌────────────────┐   ┌───────────────────┐
 │  internal/raft │   │ internal/rpc   │   │ internal/transport│
-│                │   │                │   │                  │
+│                │   │                │   │                   │
 │ Pure consensus │   │ Adapts Node's  │   │ Client-side       │
-│ logic. Knows    │   │ methods to the │   │ (dial + call) and │
-│ nothing about   │   │ net/rpc calling│   │ server-side       │
-│ networking.     │   │ convention.    │   │ (listen + accept) │
+│ logic. Knows   │   │ methods to the │   │ (dial + call) and │
+│ nothing about  │   │ net/rpc calling│   │ server-side       │
+│ networking.    │   │ convention.    │   │ (listen + accept) │
 │                │   │                │   │ real TCP/RPC.     │
-└───────┬────────┘   └────────┬───────┘   └─────────┬──────────┘
+└───────┬────────┘   └────────┬───────┘   └─────────┬─────────┘
         │                     │                     │
         │                     └──────────┬──────────┘
         │                                │
         ▼                                ▼
-┌────────────────┐             (nodes talk to each other
-│ internal/storage│              over real TCP connections)
-│                │
-│ The actual KV  │
-│ data (map +    │
-│ mutex).        │
-└────────────────┘
+┌─────────────────┐            (nodes talk to each other
+│ internal/storage│            over real TCP connections)
+│                 │
+│ The actual KV   │
+│ data (map +     │
+│ mutex).         │
+└─────────────────┘
 ```
 
 **The core design principle:** `internal/raft` is completely decoupled from networking. It defines a `Transport` interface (just two methods: send a vote request, send an append-entries request) and depends only on that interface, never on `net/rpc`, TCP, or any concrete networking detail. This is what let the project be built and tested with an in-memory fake transport first, before real networking existed, and what would let `net/rpc` be swapped for gRPC later without touching a single line of consensus logic.
@@ -279,11 +279,11 @@ A few choices worth explaining, since they weren't the only options:
 
 - **`Role` is a `string` type, not an `int` with `iota`.** Slightly more memory per value, but self-describing when logged or printed (`"Leader"` instead of `2`), which is worth it for a project where debugging election behavior via logs is a core activity.
 - **`Transport` is an interface, satisfied by both `RPCTransport` (real) and, historically, `MockTransport` (an in-process fake used during early development).** This let election and replication logic be built and tested before any real networking existed, and would let a future gRPC-based transport be swapped in without touching `raft` at all.
-- **`net/rpc` over gRPC, for now.** No code generation or protobuf tooling required, which kept the networking layer approachable while learning. gRPC remains a reasonable future upgrade, especially if cross-language interoperability ever matters.
+- **`net/rpc` over gRPC, for now.** No code generation or protobuf tooling required, keeping the networking footprint lightweight. gRPC remains a straightforward upgrade path if cross-language interoperability is required.
 - **`internal/` for almost everything currently.** Go's `internal/` convention prevents external packages from importing these, which is appropriate while the API surface is still unstable. Packages intended for the "importable library" roadmap goal will need to move out of `internal/` once their public API is deliberately designed, not accidentally exposed.
 
 ---
 
-## Acknowledgments
+## References
 
-Built as a hands-on way to learn distributed systems and consensus algorithms in Go. The [Raft paper](https://raft.github.io/raft.pdf) and its accompanying [visualization](https://raft.github.io/) were the primary references throughout.
+This implementation adheres to the specification detailed in the [Raft paper](https://raft.github.io/raft.pdf) ("In Search of an Understandable Consensus Algorithm" by Diego Ongaro and John Ousterhout). Protocol state transitions and safety invariants were verified against the official [Raft visualization](https://raft.github.io/).
