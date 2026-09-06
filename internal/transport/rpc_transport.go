@@ -25,7 +25,7 @@ func (t *RPCTransport) getClient(peer string) (*rpc.Client, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// if we have a connection to this peer, return it
+	// if we have a connection to this peer, return it; i.e the RPC client
 	if client, ok := t.clients[peer]; ok {
 		return client, nil
 	}
