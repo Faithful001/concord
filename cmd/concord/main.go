@@ -5,44 +5,128 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
+	"github.com/Faithful001/concord.git/internal/api"
+	"github.com/Faithful001/concord.git/internal/fsm"
+	"github.com/Faithful001/concord.git/internal/persist"
 	"github.com/Faithful001/concord.git/internal/raft"
+	"github.com/Faithful001/concord.git/internal/storage"
 	"github.com/Faithful001/concord.git/internal/transport"
 )
 
 func main() {
-	id := flag.String("id", "", "this node's ID")
-	addr := flag.String("addr", "", "address to listen on, e.g. localhost:8001")
-	peersFlag := flag.String("peers", "", "comma-separated id=addr pairs, e.g. node-2=localhost:8002,node-3=localhost:8003")
+	// ── Flags ─────────────────────────────────────────────────────────────────
+	id := flag.String("id", "", "unique node ID, e.g. node-1 (required)")
+	addr := flag.String("addr", "", "Raft TCP listen address, e.g. :8001 (required)")
+	apiAddr := flag.String("api-addr", "", "HTTP API listen address, e.g. :9001 (optional; omit for consensus-only mode)")
+	peersFlag := flag.String("peers", "", "comma-separated id=host:port Raft peer addresses, e.g. node-2=:8002,node-3=:8003")
+	apiPeersFlag := flag.String("api-peers", "", "comma-separated id=host:port HTTP API peer addresses, e.g. node-2=:9002,node-3=:9003")
+	dataDir := flag.String("data-dir", ".", "directory for persistent snapshots")
 	flag.Parse()
 
 	if *id == "" || *addr == "" {
 		log.Fatal("both -id and -addr are required")
 	}
 
-	addresses := make(map[string]string) // id -> address
-	
+	// ── Parse peer maps ───────────────────────────────────────────────────────
+	raftAddrs := make(map[string]string) // peerID → raft "host:port"
+	apiAddrs := make(map[string]string)  // peerID → api  "host:port"
 	var peerIDs []string
-	
+
 	if *peersFlag != "" {
 		for _, pair := range strings.Split(*peersFlag, ",") {
-			parts := strings.SplitN(pair, "=", 2)
-			addresses[parts[0]] = parts[1]
+			parts := strings.SplitN(strings.TrimSpace(pair), "=", 2)
+			if len(parts) != 2 {
+				log.Fatalf("invalid -peers entry: %q (want id=host:port)", pair)
+			}
+			raftAddrs[parts[0]] = parts[1]
 			peerIDs = append(peerIDs, parts[0])
 		}
 	}
 
-	rpcTransport := transport.NewRPCTransport(addresses)
-	node := raft.NewNode(*id, peerIDs, rpcTransport)
+	if *apiPeersFlag != "" {
+		for _, pair := range strings.Split(*apiPeersFlag, ",") {
+			parts := strings.SplitN(strings.TrimSpace(pair), "=", 2)
+			if len(parts) != 2 {
+				log.Fatalf("invalid -api-peers entry: %q (want id=host:port)", pair)
+			}
+			apiAddrs[parts[0]] = parts[1]
+		}
+	}
 
+	// ── Load snapshot (if any) ────────────────────────────────────────────────
+	snap, err := persist.Load(*dataDir, *id)
+	if err != nil {
+		log.Fatalf("[%s] failed to load snapshot: %v", *id, err)
+	}
+
+	// ── Build components ──────────────────────────────────────────────────────
+	store := storage.NewStore()
+	rpcTransport := transport.NewRPCTransport(raftAddrs)
+	node := raft.NewNode(*id, peerIDs, rpcTransport)
+	stateMachine := fsm.New(store)
+
+	// ── Restore snapshot ──────────────────────────────────────────────────────
+	if snap != nil {
+		node.RestoreSnapshot(snap.ToSnapshotState())
+
+		// Replay all committed entries directly into the FSM so the in-memory
+		// store reflects the pre-crash state.  We do this before starting the
+		// FSM goroutine to avoid a data race between direct calls and the channel.
+		snapState := node.TakeSnapshot()
+		for _, entry := range snapState.Log {
+			if entry.Index <= snapState.CommitIndex {
+				stateMachine.ApplyEntry(raft.ApplyMsg{
+					Index:   entry.Index,
+					Command: entry.Command,
+				})
+			}
+		}
+		log.Printf("[%s] snapshot restored: replayed %d committed entries", *id, snapState.CommitIndex)
+	}
+
+	// ── Start FSM goroutine ───────────────────────────────────────────────────
+	// All future committed entries arrive via node.ApplyCh() and are applied here.
+	go stateMachine.Run(node.ApplyCh())
+
+	// ── Periodic snapshot ─────────────────────────────────────────────────────
 	go func() {
-		fmt.Printf("[%s] listening on %s\n", *id, *addr)
-		if err := transport.Serve(node, *addr); err != nil {
-			log.Fatalf("serve failed: %v", err)
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			state := node.TakeSnapshot()
+			if saveErr := persist.Save(*dataDir, *id, persist.FromSnapshotState(state)); saveErr != nil {
+				log.Printf("[%s] snapshot save error: %v", *id, saveErr)
+			} else {
+				log.Printf("[%s] snapshot saved (term=%d entries=%d commitIndex=%d)",
+					*id, state.CurrentTerm, len(state.Log), state.CommitIndex)
+			}
 		}
 	}()
 
+	// ── Raft TCP listener ─────────────────────────────────────────────────────
+	go func() {
+		fmt.Printf("[%s] Raft listening on %s\n", *id, *addr)
+		if serveErr := transport.Serve(node, *addr); serveErr != nil {
+			log.Fatalf("[%s] Raft serve failed: %v", *id, serveErr)
+		}
+	}()
+
+	// ── HTTP API server (optional) ────────────────────────────────────────────
+	if *apiAddr != "" {
+		apiServer := api.New(*id, node, store, apiAddrs)
+		go func() {
+			if serveErr := apiServer.Serve(*apiAddr); serveErr != nil {
+				log.Fatalf("[%s] API serve failed: %v", *id, serveErr)
+			}
+		}()
+	} else {
+		log.Printf("[%s] -api-addr not set; running in consensus-only mode (no HTTP API)", *id)
+	}
+
+	// ── Start consensus ───────────────────────────────────────────────────────
 	node.Start()
 
-	select {} // block forever
+	select {} // block forever — background goroutines do all the work
 }

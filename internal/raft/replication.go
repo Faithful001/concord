@@ -1,67 +1,76 @@
 package raft
 
+import "log"
+
+// AppendEntries is called by the leader to replicate log entries and send
+// heartbeats.  It implements §5.3 of the Raft paper.
 func (n *Node) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	// §5.1: reply false if args.Term < currentTerm.
 	if args.Term < n.currentTerm {
-		return &AppendEntriesReply{
-			Term:    n.currentTerm,
-			Success: false,
-		}
+		return &AppendEntriesReply{Term: n.currentTerm, Success: false}
 	}
 
+	// Higher or equal term from a valid leader — update term and step down.
 	if args.Term > n.currentTerm {
 		n.currentTerm = args.Term
 		n.votedFor = ""
+		n.clearCommitWaiters(ErrNotLeader)
 	}
 
+	n.role = Follower
+	n.leaderID = args.LeaderID // remember who the leader is for forwarding
 	n.resetElectionTimeout()
 
-	n.role = Follower
-
+	// §5.3: consistency check — do we have an entry at PrevLogIndex with
+	// matching term?
 	if args.PrevLogIndex > 0 {
 		term, ok := n.termAt(args.PrevLogIndex)
-
 		if !ok || term != args.PrevLogTerm {
-			return &AppendEntriesReply{
-				Term:    n.currentTerm,
-				Success: false,
-			}
+			return &AppendEntriesReply{Term: n.currentTerm, Success: false}
 		}
 	}
 
+	// §5.3: merge entries into our log.
 	for _, entry := range args.Entries {
 		existingTerm, ok := n.termAt(entry.Index)
 		switch {
 		case ok && existingTerm != entry.Term:
+			// Conflict: truncate from this point and take the leader's version.
 			n.log = n.log[:entry.Index-1]
 			n.log = append(n.log, entry)
 		case !ok:
+			// New entry past the end of our log — append it.
 			n.log = append(n.log, entry)
+		// case ok && existingTerm == entry.Term: already present, skip.
 		}
 	}
 
+	// §5.3: advance commitIndex.
 	if args.LeaderCommitIndex > n.commitIndex {
 		lastNewIndex := args.PrevLogIndex + len(args.Entries)
-		if args.LeaderCommitIndex < lastNewIndex {
-			n.commitIndex = args.LeaderCommitIndex
-		} else {
-			n.commitIndex = lastNewIndex
+		newCommit := args.LeaderCommitIndex
+		if newCommit > lastNewIndex {
+			newCommit = lastNewIndex
+		}
+		if newCommit > n.commitIndex {
+			old := n.commitIndex
+			n.commitIndex = newCommit
+			log.Printf("[%s] follower advancing commitIndex to %d", n.id, n.commitIndex)
+			n.sendToApplyCh(old, n.commitIndex)
 		}
 	}
 
-	return &AppendEntriesReply{
-		Term:    n.currentTerm,
-		Success: true,
-	}
+	return &AppendEntriesReply{Term: n.currentTerm, Success: true}
 }
 
-// termAt returns the term at log index, and whether it exists.
+// termAt returns the term of the log entry at the given 1-based index, and
+// whether such an entry exists.
 func (n *Node) termAt(index int) (int, bool) {
 	if index < 1 || index > len(n.log) {
 		return 0, false
 	}
-
 	return n.log[index-1].Term, true
 }

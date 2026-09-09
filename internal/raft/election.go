@@ -1,65 +1,66 @@
 package raft
 
 import (
+	"errors"
 	"log"
-	"math/rand"
 	"sync"
 	"time"
 )
 
+// heartbeatInterval is the fixed interval between leader heartbeat / replication
+// rounds.  Must be well below the minimum election timeout (150 ms).
+const heartbeatInterval = 75 * time.Millisecond
+
+// ── RequestVote ───────────────────────────────────────────────────────────────
+
+// RequestVote is called by candidates soliciting a vote.
 func (n *Node) RequestVote(args *RequestVoteArgs) *RequestVoteReply {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	if args.Term < n.currentTerm {
-		return &RequestVoteReply{
-			Term:        n.currentTerm,
-			VoteGranted: false,
-		}
+		return &RequestVoteReply{Term: n.currentTerm, VoteGranted: false}
 	}
 
 	if args.Term > n.currentTerm {
 		n.currentTerm = args.Term
 		n.role = Follower
 		n.votedFor = ""
+		n.clearCommitWaiters(ErrNotLeader)
 	}
 
 	lastIndex, lastTerm := n.lastLogIndexAndTerm()
-	candidateLogIsUpToDate := args.LastLogTerm > lastTerm ||
+	// §5.4.1: candidate's log must be at least as up-to-date as ours.
+	candidateUpToDate := args.LastLogTerm > lastTerm ||
 		(args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIndex)
 
 	voteGranted := false
-	if (n.votedFor == "" || n.votedFor == args.CandidateID) && candidateLogIsUpToDate {
+	if (n.votedFor == "" || n.votedFor == args.CandidateID) && candidateUpToDate {
 		n.votedFor = args.CandidateID
 		n.role = Follower
 		voteGranted = true
+		n.resetElectionTimeout()
 	}
 
-	log.Printf("[%s] vote for %s in term %d: %v", n.id, args.CandidateID, args.Term, voteGranted)
-
-	return &RequestVoteReply{
-		Term:        n.currentTerm,
-		VoteGranted: voteGranted,
-	}
+	log.Printf("[%s] RequestVote from %s term=%d granted=%v", n.id, args.CandidateID, args.Term, voteGranted)
+	return &RequestVoteReply{Term: n.currentTerm, VoteGranted: voteGranted}
 }
 
-type Transport interface {
-	SendRequestVote(peer string, args *RequestVoteArgs) (*RequestVoteReply, error)
-	SendAppendEntries(peer string, args *AppendEntriesArgs) (*AppendEntriesReply, error)
-}
+// ── Election ──────────────────────────────────────────────────────────────────
 
 func (n *Node) startElection(transport Transport) {
 	n.mu.Lock()
 
 	n.currentTerm++
 	n.role = Candidate
-	log.Printf("[%s] starting election for term %d", n.id, n.currentTerm)
+	n.leaderID = ""
 	n.votedFor = n.id
 	electionTerm := n.currentTerm
 	lastIndex, lastTerm := n.lastLogIndexAndTerm()
 	candidateID := n.id
 	peers := n.peers
 
+	log.Printf("[%s] starting election for term %d", n.id, electionTerm)
 	n.mu.Unlock()
 
 	n.resetElectionTimeout()
@@ -86,6 +87,7 @@ func (n *Node) startElection(transport Transport) {
 			n.mu.Lock()
 			defer n.mu.Unlock()
 
+			// Stale reply — term or role changed while we waited.
 			if n.currentTerm != electionTerm || n.role != Candidate {
 				return
 			}
@@ -94,6 +96,7 @@ func (n *Node) startElection(transport Transport) {
 				n.currentTerm = reply.Term
 				n.role = Follower
 				n.votedFor = ""
+				n.clearCommitWaiters(ErrNotLeader)
 				return
 			}
 
@@ -113,11 +116,12 @@ func (n *Node) startElection(transport Transport) {
 	wg.Wait()
 }
 
+// becomeLeader transitions this node to the Leader role and starts the
+// replication loop.  Must be called with n.mu held.
 func (n *Node) becomeLeader() {
 	n.role = Leader
+	n.leaderID = n.id
 	log.Printf("[%s] became leader for term %d", n.id, n.currentTerm)
-	n.nextIndex = make(map[string]int)
-	n.matchIndex = make(map[string]int)
 
 	lastIndex, _ := n.lastLogIndexAndTerm()
 	for _, peer := range n.peers {
@@ -128,8 +132,12 @@ func (n *Node) becomeLeader() {
 	go n.sendHeartbeats(n.currentTerm)
 }
 
+// ── Replication loop (leader-side) ───────────────────────────────────────────
+
+// sendHeartbeats ticks at heartbeatInterval and drives a replication round to
+// each peer on every tick.  It exits when this node is no longer the leader.
 func (n *Node) sendHeartbeats(leaderTerm int) {
-	ticker := time.NewTicker(randomHeartbeatInterval())
+	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 
 	for range ticker.C {
@@ -139,48 +147,113 @@ func (n *Node) sendHeartbeats(leaderTerm int) {
 			return
 		}
 		peers := n.peers
-		leaderID := n.id
-		commitIndex := n.commitIndex
-		transport := n.transport
 		n.mu.Unlock()
 
 		for _, peer := range peers {
-			go func(peer string) {
-				reply, err := transport.SendAppendEntries(peer, &AppendEntriesArgs{
-					Term:              leaderTerm,
-					LeaderID:          leaderID,
-					PrevLogIndex:      0,
-					PrevLogTerm:       0,
-					Entries:           []LogEntry{},
-					LeaderCommitIndex: commitIndex,
-				})
-				if err != nil {
-					return
-				}
-
-				n.mu.Lock()
-				defer n.mu.Unlock()
-
-				if reply.Term > n.currentTerm {
-					n.currentTerm = reply.Term
-					n.role = Follower
-					n.votedFor = ""
-				}
-			}(peer)
+			go n.replicateToPeer(peer, leaderTerm)
 		}
 	}
 }
 
-func randomHeartbeatInterval() time.Duration {
-	return time.Duration(50+rand.Intn(51)) * time.Millisecond // 50–100ms
+// replicateToPeer sends an AppendEntries RPC to peer carrying any log entries
+// it is missing (or an empty heartbeat if it is caught up).
+// On a successful reply it advances matchIndex / nextIndex and checks for a
+// new commit point.  On failure it backs up nextIndex for the next round.
+func (n *Node) replicateToPeer(peer string, leaderTerm int) {
+	n.mu.Lock()
+	if n.role != Leader || n.currentTerm != leaderTerm {
+		n.mu.Unlock()
+		return
+	}
+
+	nextIdx := n.nextIndex[peer]
+	lastIdx, _ := n.lastLogIndexAndTerm()
+
+	// Collect the entries this peer is missing (empty slice = heartbeat).
+	var entries []LogEntry
+	if nextIdx <= lastIdx {
+		src := n.log[nextIdx-1 : lastIdx]
+		entries = make([]LogEntry, len(src))
+		copy(entries, src)
+	}
+
+	prevLogIndex := nextIdx - 1
+	prevLogTerm := 0
+	if prevLogIndex > 0 && prevLogIndex <= len(n.log) {
+		prevLogTerm = n.log[prevLogIndex-1].Term
+	}
+
+	commitIndex := n.commitIndex
+	leaderID := n.id
+	transport := n.transport
+	n.mu.Unlock()
+
+	reply, err := transport.SendAppendEntries(peer, &AppendEntriesArgs{
+		Term:              leaderTerm,
+		LeaderID:          leaderID,
+		PrevLogIndex:      prevLogIndex,
+		PrevLogTerm:       prevLogTerm,
+		Entries:           entries,
+		LeaderCommitIndex: commitIndex,
+	})
+	if err != nil {
+		return
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.role != Leader || n.currentTerm != leaderTerm {
+		return
+	}
+
+	if reply.Term > n.currentTerm {
+		// Discovered a higher term — step down.
+		n.currentTerm = reply.Term
+		n.role = Follower
+		n.votedFor = ""
+		n.clearCommitWaiters(errors.New("raft: stepped down from leader"))
+		return
+	}
+
+	if reply.Success {
+		newMatch := prevLogIndex + len(entries)
+		if newMatch > n.matchIndex[peer] {
+			n.matchIndex[peer] = newMatch
+		}
+		n.nextIndex[peer] = n.matchIndex[peer] + 1
+		n.maybeAdvanceCommitIndex(leaderTerm)
+	} else {
+		// Consistency check failed — back up and retry next tick.
+		if n.nextIndex[peer] > 1 {
+			n.nextIndex[peer]--
+		}
+	}
 }
 
-// lastLogIndexAndTerm returns the index and term of our last log entry,
-// or (0, 0) if the log's empty.
-func (n *Node) lastLogIndexAndTerm() (int, int) {
-	if len(n.log) == 0 {
-		return 0, 0
+// maybeAdvanceCommitIndex finds the highest N > commitIndex such that
+// log[N-1].Term == leaderTerm and a majority of nodes have matchIndex >= N,
+// then commits up to N.  Must be called with n.mu held.
+func (n *Node) maybeAdvanceCommitIndex(leaderTerm int) {
+	lastIdx, _ := n.lastLogIndexAndTerm()
+	for N := lastIdx; N > n.commitIndex; N-- {
+		if N > len(n.log) || n.log[N-1].Term != leaderTerm {
+			continue
+		}
+		count := 1 // leader itself
+		for _, peer := range n.peers {
+			if n.matchIndex[peer] >= N {
+				count++
+			}
+		}
+		// Majority check (works for any cluster size, including single-node).
+		if count*2 > len(n.peers)+1 {
+			old := n.commitIndex
+			n.commitIndex = N
+			log.Printf("[%s] leader committed up to index %d", n.id, N)
+			n.sendToApplyCh(old, N)
+			n.notifyCommitWaiters(old, N)
+			break
+		}
 	}
-	last := n.log[len(n.log)-1]
-	return last.Index, last.Term
 }

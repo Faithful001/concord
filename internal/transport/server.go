@@ -5,13 +5,19 @@ import (
 	"net/rpc"
 
 	"github.com/Faithful001/concord.git/internal/raft"
-	rpcPath "github.com/Faithful001/concord.git/internal/rpc"
+	rpcSvc "github.com/Faithful001/concord.git/internal/rpc"
 )
 
-// Serve registers and listens for incoming Raft RPCs on addr.
+// Serve registers the node's RPC methods and starts accepting connections on
+// addr.  It blocks until the listener is closed.
+//
+// A fresh rpc.Server is used (rather than the package-level default) so that
+// multiple nodes can be started in the same process without "already
+// registered" panics — useful for integration tests.
 func Serve(node *raft.Node, addr string) error {
-	service := rpcPath.NewRPCService(node)
-	if err := rpc.Register(service); err != nil {
+	srv := rpc.NewServer()
+	service := rpcSvc.NewRPCService(node)
+	if err := srv.Register(service); err != nil {
 		return err
 	}
 
@@ -20,6 +26,6 @@ func Serve(node *raft.Node, addr string) error {
 		return err
 	}
 
-	rpc.Accept(listener) // blocks, handling connections until listener (net.Listen) closes
+	srv.Accept(listener) // blocks until listener is closed
 	return nil
 }

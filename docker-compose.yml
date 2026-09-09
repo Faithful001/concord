@@ -1,0 +1,84 @@
+# docker-compose.yml — 3-node Concord cluster
+#
+# Usage:
+#   docker compose up --build          # foreground
+#   docker compose up --build -d       # detached
+#   docker compose down                # tear down
+#   docker compose down -v             # tear down + wipe volumes
+#
+# After the cluster elects a leader, try:
+#   curl -X PUT http://localhost:9001/v1/kv/hello \
+#        -H "Content-Type: application/json" \
+#        -d '{"value":"world"}'
+#   curl http://localhost:9002/v1/kv/hello
+#   curl http://localhost:9001/v1/status
+
+version: "3.9"
+
+x-concord-common: &concord-common
+  build: .
+  restart: unless-stopped
+  networks:
+    - concord-net
+
+services:
+
+  node1:
+    <<: *concord-common
+    container_name: concord-node1
+    hostname: node1
+    command: >-
+      -id node-1
+      -addr :8001
+      -api-addr :9001
+      -peers node-2=node2:8002,node-3=node3:8003
+      -api-peers node-2=node2:9002,node-3=node3:9003
+      -data-dir /data
+    ports:
+      - "8001:8001"   # Raft
+      - "9001:9001"   # HTTP API
+    volumes:
+      - node1-data:/data
+
+  node2:
+    <<: *concord-common
+    container_name: concord-node2
+    hostname: node2
+    command: >-
+      -id node-2
+      -addr :8002
+      -api-addr :9002
+      -peers node-1=node1:8001,node-3=node3:8003
+      -api-peers node-1=node1:9001,node-3=node3:9003
+      -data-dir /data
+    ports:
+      - "8002:8002"
+      - "9002:9002"
+    volumes:
+      - node2-data:/data
+
+  node3:
+    <<: *concord-common
+    container_name: concord-node3
+    hostname: node3
+    command: >-
+      -id node-3
+      -addr :8003
+      -api-addr :9003
+      -peers node-1=node1:8001,node-2=node2:8002
+      -api-peers node-1=node1:9001,node-2=node2:9002
+      -data-dir /data
+    ports:
+      - "8003:8003"
+      - "9003:9003"
+    volumes:
+      - node3-data:/data
+
+networks:
+  concord-net:
+    driver: bridge
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

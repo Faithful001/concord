@@ -1,1 +1,17 @@
+# Environment
 .env
+
+# Build output
+bin/
+tmp/
+
+# Snapshot data (local dev)
+data/
+*.snap
+*.snap.tmp
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

@@ -9,17 +9,18 @@ Concord replicates data across multiple machines and keeps working correctly eve
 ## Table of Contents
 
 - [Why Raft, why this project](#why-raft-why-this-project)
-- [Current status](#current-status)
+- [Features](#features)
+- [Quick start](#quick-start)
 - [Architecture overview](#architecture-overview)
 - [Package-by-package breakdown](#package-by-package-breakdown)
 - [How a node starts up](#how-a-node-starts-up)
 - [How leader election works](#how-leader-election-works)
 - [How log replication works](#how-log-replication-works)
 - [The networking layer](#the-networking-layer)
-- [Running a cluster today](#running-a-cluster-today)
-- [What's missing](#whats-missing)
-- [Roadmap](#roadmap)
+- [HTTP API reference](#http-api-reference)
+- [Provisioning on a VPS](#provisioning-on-a-vps)
 - [Design decisions and why](#design-decisions-and-why)
+- [Roadmap](#roadmap)
 
 ---
 
@@ -37,27 +38,77 @@ Concord implements all three from the ground up, providing a clean, production-g
 
 ---
 
-## Current status
+## Features
 
-**What works today:**
+- ✅ **Full Raft consensus**: leader election, log replication, safety invariants
+- ✅ **HTTP API**: `GET`/`PUT`/`DELETE` keys via a clean REST API
+- ✅ **Leader forwarding**: writes to any node are automatically routed to the leader
+- ✅ **FSM (Finite State Machine)**: committed log entries are applied to the KV store
+- ✅ **Persistence**: periodic JSON snapshots — nodes survive restarts
+- ✅ **Docker & Compose**: one command spins up a 3-node cluster anywhere
+- ✅ **Provisionable**: works on localhost, VPS, or any machine with Docker or Go installed
 
-- ✅ In-memory key-value storage (`Get`/`Set`/`Delete`), fully tested
-- ✅ Leader election (`RequestVote`), including the log-up-to-date safety check
-- ✅ Log replication and consistency checking (`AppendEntries`), including conflict detection and log truncation
-- ✅ Randomized election timeouts, with proper reset-on-heartbeat behavior
-- ✅ Leader heartbeats, sent on an interval to all peers
-- ✅ Real networking: nodes run as separate OS processes, communicating over TCP via Go's `net/rpc`
-- ✅ Nodes correctly step down when they discover a higher term (from votes, heartbeats, or replies)
+---
 
-**What's not built yet:**
+## Quick start
 
-- ❌ No FSM: committed log entries are not yet applied to the actual key-value store
-- ❌ No client-facing API: there's no way for an external caller to actually `SET`/`GET`/`DELETE` a key against the cluster
-- ❌ No persistence: everything is in-memory; a node restart loses all state
-- ❌ No snapshotting or log compaction
-- ❌ No cluster membership changes (adding/removing nodes while running)
+### Option 1: Docker Compose (recommended)
 
-In short: **the consensus core works (nodes correctly elect a leader and replicate a log), but there's currently no way to actually store or retrieve real data through it.** See [What's missing](#whats-missing) and [Roadmap](#roadmap) below.
+```bash
+git clone https://github.com/Faithful001/concord.git
+cd concord
+docker compose up --build
+```
+
+This starts a 3-node cluster. Within a second, one node wins the election. Then:
+
+```bash
+# Write a key
+curl -X PUT http://localhost:9001/v1/kv/hello \
+     -H "Content-Type: application/json" \
+     -d '{"value":"world"}'
+
+# Read it back (from any node — even a follower)
+curl http://localhost:9002/v1/kv/hello
+
+# Check cluster status
+curl http://localhost:9001/v1/status
+
+# Delete a key
+curl -X DELETE http://localhost:9001/v1/kv/hello
+```
+
+### Option 2: Local (3 terminals)
+
+```bash
+go build -o bin/concord ./cmd/concord
+
+# Terminal 1
+./bin/concord -id node-1 -addr localhost:8001 -api-addr localhost:9001 \
+  -peers node-2=localhost:8002,node-3=localhost:8003 \
+  -api-peers node-2=localhost:9002,node-3=localhost:9003 \
+  -data-dir data/node-1
+
+# Terminal 2
+./bin/concord -id node-2 -addr localhost:8002 -api-addr localhost:9002 \
+  -peers node-1=localhost:8001,node-3=localhost:8003 \
+  -api-peers node-1=localhost:9001,node-3=localhost:9003 \
+  -data-dir data/node-2
+
+# Terminal 3
+./bin/concord -id node-3 -addr localhost:8003 -api-addr localhost:9003 \
+  -peers node-1=localhost:8001,node-2=localhost:8002 \
+  -api-peers node-1=localhost:9001,node-2=localhost:9002 \
+  -data-dir data/node-3
+```
+
+Or use the Makefile shortcuts: `make run-node1`, `make run-node2`, `make run-node3`.
+
+### Option 3: go install
+
+```bash
+go install github.com/Faithful001/concord.git/cmd/concord@latest
+```
 
 ---
 
@@ -92,7 +143,16 @@ In short: **the consensus core works (nodes correctly elect a leader and replica
 │ The actual KV   │
 │ data (map +     │
 │ mutex).         │
-└─────────────────┘
+└────────┬────────┘
+         │
+         ▲
+┌────────┴────────┐           ┌───────────────────┐
+│ internal/fsm    │           │ internal/api      │
+│                 │           │                   │
+│ Applies commit- │           │ HTTP REST API.    │
+│ ted log entries ├──────────▶│ Leader forwarding │
+│ to the KV store │           │ built in.         │
+└─────────────────┘           └───────────────────┘
 ```
 
 **The core design principle:** `internal/raft` is completely decoupled from networking. It defines a `Transport` interface (just two methods: send a vote request, send an append-entries request) and depends only on that interface, never on `net/rpc`, TCP, or any concrete networking detail. This is what let the project be built and tested with an in-memory fake transport first, before real networking existed, and what would let `net/rpc` be swapped for gRPC later without touching a single line of consensus logic.
@@ -103,18 +163,20 @@ In short: **the consensus core works (nodes correctly elect a leader and replica
 
 ### `cmd/concord/`
 
-The entry point. Parses command-line flags (`-id`, `-addr`, `-peers`), constructs a `Node` and its `Transport`, starts the node's background loops, and blocks forever.
+The entry point. Parses command-line flags (`-id`, `-addr`, `-api-addr`, `-peers`, `-api-peers`, `-data-dir`), constructs a `Node` and its `Transport`, restores any saved snapshot, starts the FSM goroutine and periodic snapshot saver, starts the HTTP API server, and blocks forever.
 
 ### `internal/raft/`
 
 The heart of the project: Raft consensus, with zero networking knowledge.
 
-- **`node.go`**: the `Node` struct: all persistent state (`currentTerm`, `votedFor`, `log`), volatile state (`commitIndex`, `lastApplied`), and leader-only state (`nextIndex`, `matchIndex`). Also the election timer setup (`Start`, `Stop`, `resetElectionTimeout`) and its background loop (`electionTimerLoop`).
+- **`node.go`**: the `Node` struct: all persistent state (`currentTerm`, `votedFor`, `log`), volatile state (`commitIndex`, `lastApplied`), and leader-only state (`nextIndex`, `matchIndex`). Also: `Submit()` (leader appends a command and waits for commit), `TakeSnapshot()` / `RestoreSnapshot()`, `ApplyCh()`, the commit waiter system, and the election timer goroutine.
 - **`role.go`**: the `Role` type (`Follower`, `Candidate`, `Leader`), a string-based enum for readable logging.
-- **`election.go`**: `RequestVote` (the vote-granting handler) and `startElection`/`becomeLeader` (the candidate-side election logic and leader heartbeat startup).
-- **`replication.go`**: `AppendEntries`: the consistency check, conflict detection/log truncation, and commit-index advancement.
+- **`election.go`**: `RequestVote` (the vote-granting handler), `startElection`/`becomeLeader` (the candidate-side logic), `sendHeartbeats` (the leader's replication loop), `replicateToPeer` (sends missing entries + handles matchIndex), and `maybeAdvanceCommitIndex` (the commit-point calculation).
+- **`replication.go`**: `AppendEntries` (the follower-side consistency check, conflict detection/log truncation, and commit-index advancement with FSM notification).
 - **`log.go`**: the `LogEntry` type: `Term`, `Index`, and an opaque `Command []byte` (Raft never interprets the command itself, as that's the FSM's job).
 - **`transport.go`**: the `Transport` interface that `raft` depends on but never implements.
+- **`apply.go`**: `ApplyMsg` (the message type sent to the FSM) and `SnapshotState` (serialisable persistent state).
+- **`messages.go`**: `RequestVoteArgs`/`Reply` and `AppendEntriesArgs`/`Reply` RPC message types.
 
 ### `internal/rpc/`
 
@@ -131,24 +193,35 @@ The real, network-based implementation of `raft.Transport`.
 
 A plain, thread-safe, in-memory key-value store (`Store`), independent of Raft entirely. `Get`, `Set`, `Delete`, backed by a `map[string][]byte` and a `sync.RWMutex`. Returns a sentinel `ErrKeyNotFound` for missing keys, so callers can check with `errors.Is`.
 
-### `internal/fsm/` _(planned, not yet built)_
+### `internal/command/`
 
-Will be the glue between a committed Raft log entry and the actual `storage.Store`: decoding `LogEntry.Command` and applying it. See [Roadmap](#roadmap).
+Encodes and decodes the opaque `Command []byte` stored inside each Raft `LogEntry`. The Raft layer never interprets these bytes; the FSM decodes them to decide what to apply. Supports `SET` (opcode `0x01`, key + value) and `DELETE` (opcode `0x02`, key only).
 
-### `internal/api/` _(planned, not yet built)_
+### `internal/fsm/`
 
-Will be the client-facing layer: accepting `SET`/`GET`/`DELETE` requests from outside the cluster, forwarding writes to the current leader if needed. See [Roadmap](#roadmap).
+The glue between a committed Raft log entry and the actual `storage.Store`: decoding `LogEntry.Command` via the `command` package and applying the resulting `SET` or `DELETE` operation. Runs as a goroutine reading from the node's `applyCh`. Also supports direct `ApplyEntry()` calls for snapshot replay at startup.
+
+### `internal/persist/`
+
+Simple JSON snapshot persistence. Atomically saves `{currentTerm, votedFor, log[], commitIndex}` to a `.snap` file using a temp-file + rename pattern. On startup, loads the snapshot if it exists (returns `nil` for fresh nodes). Snapshots are taken every 30 seconds by default.
+
+### `internal/api/`
+
+The client-facing HTTP API. Exposes `GET /v1/kv/{key}`, `PUT /v1/kv/{key}`, `DELETE /v1/kv/{key}`, `GET /v1/status`, and `GET /healthz`. Writes check if this node is the leader: if yes, they call `node.Submit()` directly; if no, they reverse-proxy the request to the leader's API address.
 
 ---
 
 ## How a node starts up
 
-1. `main.go` parses `-id`, `-addr`, and `-peers` from the command line.
-2. It builds an `RPCTransport`, seeded with a map of peer ID → address.
-3. It constructs a `Node` via `raft.NewNode(id, peerIDs, transport)`: the node starts as a `Follower`, with `currentTerm = 0` and an empty log.
-4. It launches `transport.Serve(node, addr)` in its own goroutine, which opens a TCP listener and blocks forever, accepting incoming RPCs from peers.
-5. It calls `node.Start()`, which launches `electionTimerLoop()` in its own goroutine, which is what will eventually trigger an election if no leader is heard from.
-6. `main()` itself blocks forever on an empty `select {}`, keeping the process alive while the two background goroutines do the real work.
+1. `main.go` parses `-id`, `-addr`, `-api-addr`, `-peers`, `-api-peers`, and `-data-dir` from the command line.
+2. It attempts to load a snapshot from `<data-dir>/<id>.snap`. If found, it restores the Raft state and replays all committed log entries into the FSM directly (so the in-memory KV store reflects pre-crash state).
+3. It builds an `RPCTransport`, seeded with a map of peer ID → address.
+4. It constructs a `Node` via `raft.NewNode(id, peerIDs, transport)`: the node starts as a `Follower`.
+5. It starts the FSM goroutine (reads from `node.ApplyCh()`) and the periodic snapshot goroutine (every 30 seconds).
+6. It launches `transport.Serve(node, addr)` in its own goroutine, which opens a TCP listener and blocks forever, accepting incoming RPCs from peers.
+7. If `-api-addr` is set, it starts the HTTP API server.
+8. It calls `node.Start()`, which launches `electionTimerLoop()` in its own goroutine, which is what will eventually trigger an election if no leader is heard from.
+9. `main()` itself blocks forever on an empty `select {}`, keeping the process alive while the background goroutines do the real work.
 
 At this point, every node in the cluster has an election timer running, counting down a random duration (150-300ms): the first one to time out (since no leader exists yet) will become a candidate.
 
@@ -172,16 +245,15 @@ Randomized timeouts (a fresh random value chosen every time the timer restarts) 
 
 ## How log replication works
 
-_(Note: as of today, replication moves log entries between nodes correctly, but nothing yet applies committed entries to the actual key-value store: see [What's missing](#whats-missing).)_
-
-1. The leader sends `AppendEntries` to every peer, either as a heartbeat (empty `Entries`) on a fixed interval, or carrying real new log entries when there's data to replicate.
-2. Each follower's `AppendEntries` handler:
+1. When a client sends a `PUT` or `DELETE` to the leader's API, the handler calls `node.Submit(cmd)`, which appends the command to the leader's log and blocks until it commits.
+2. The leader's `sendHeartbeats` loop ticks every 75ms. On each tick, `replicateToPeer` sends an `AppendEntries` to every peer carrying any log entries that peer is missing (based on `nextIndex`). If the peer is caught up, it sends an empty heartbeat.
+3. Each follower's `AppendEntries` handler:
    - Rejects if the leader's term is stale.
-   - Catches up its own term if the leader's is newer, and resets its election timer (proof the leader is alive).
-   - Runs a **consistency check**: does it have an entry at `PrevLogIndex` matching `PrevLogTerm`? If not, reject: the leader will back up and retry with earlier entries.
+   - Catches up its own term if the leader's is newer, stores the `leaderID`, and resets its election timer (proof the leader is alive).
+   - Runs a **consistency check**: does it have an entry at `PrevLogIndex` matching `PrevLogTerm`? If not, reject: the leader will back up `nextIndex` and retry with earlier entries.
    - For each new entry: if there's a **conflicting** entry already at that index (same index, different term, evidence of an old, abandoned leader's uncommitted writes), truncate the log from that point and take the leader's version. If the entry is new, append it. If it's already present and matches, skip it.
-   - Advances its own `commitIndex` to match the leader's, capped at what it's actually received so far.
-3. The leader considers an entry committed once a majority of followers have acknowledged it (tracked via `matchIndex`).
+   - Advances its own `commitIndex` to match the leader's, capped at what it's actually received so far. Newly committed entries are sent to the FSM via `applyCh`.
+4. On the leader side, a successful reply advances `matchIndex` for that peer. `maybeAdvanceCommitIndex` then scans for the highest N > commitIndex where `log[N].Term == currentTerm` and a majority have `matchIndex >= N`. When found, `commitIndex` advances to N, the FSM receives the entries, and any `Submit()` callers waiting on those indices are unblocked.
 
 ---
 
@@ -190,86 +262,155 @@ _(Note: as of today, replication moves log entries between nodes correctly, but 
 Concord uses Go's built-in `net/rpc` package over raw TCP: no protobuf or code generation required, keeping the stack simple while still being genuine inter-process networking.
 
 - **`net.Listen("tcp", addr)`** opens a real TCP socket: pure networking, no RPC-specific behavior yet.
-- **`rpc.Register(service)`** tells `net/rpc` to expose `RPCService`'s methods, callable remotely by the string `"RPCService.MethodName"`.
-- **`rpc.Accept(listener)`** sits on top of the listener, handling incoming connections: reading which method was requested, decoding arguments, calling the real Go method, and writing back the reply.
+- **`rpc.NewServer()` + `srv.Register(service)`** tells `net/rpc` to expose `RPCService`'s methods, callable remotely by the string `"RPCService.MethodName"`.
+- **`srv.Accept(listener)`** sits on top of the listener, handling incoming connections: reading which method was requested, decoding arguments, calling the real Go method, and writing back the reply.
 - On the client side, **`rpc.Dial("tcp", addr)`** opens a connection to a peer, and **`client.Call("RPCService.RequestVote", args, &reply)`** performs the actual remote call: serializing `args`, sending them, and blocking until the reply arrives.
 
 Every node in the cluster runs **both** a server (via `transport.Serve`, so peers can reach it) and a client (via `RPCTransport`, so it can reach peers). There's no single "the server" in a peer-to-peer system like this.
 
 ---
 
-## Running a cluster today
+## HTTP API reference
 
-Three separate terminals, each running one node as its own OS process:
+All endpoints return JSON (except `/healthz`).
+
+### `PUT /v1/kv/{key}`
+
+Set a key.
 
 ```bash
-go run ./cmd/concord -id node-1 -addr localhost:8001 -peers node-2=localhost:8002,node-3=localhost:8003
-go run ./cmd/concord -id node-2 -addr localhost:8002 -peers node-1=localhost:8001,node-3=localhost:8003
-go run ./cmd/concord -id node-3 -addr localhost:8003 -peers node-1=localhost:8001,node-2=localhost:8002
+curl -X PUT http://localhost:9001/v1/kv/mykey \
+     -H "Content-Type: application/json" \
+     -d '{"value":"myvalue"}'
 ```
 
-Within a few hundred milliseconds, you should see one node's election timeout fire, an election happen, and one node log that it's become leader. Heartbeats then keep the cluster stable, so no further elections should occur unless a node is killed.
+**Response (200 OK):**
+```json
+{"key":"mykey","value":"myvalue"}
+```
 
-**There is currently no way to actually read or write data**: this demonstrates consensus (leader election + log replication), not yet a usable key-value store. See below.
+### `GET /v1/kv/{key}`
+
+Read a key.
+
+```bash
+curl http://localhost:9001/v1/kv/mykey
+```
+
+**Response (200 OK):**
+```json
+{"key":"mykey","value":"myvalue"}
+```
+
+**Response (404 Not Found):**
+```json
+{"error":"key not found"}
+```
+
+### `DELETE /v1/kv/{key}`
+
+Delete a key.
+
+```bash
+curl -X DELETE http://localhost:9001/v1/kv/mykey
+```
+
+**Response: 204 No Content**
+
+### `GET /v1/status`
+
+Node status and leader info.
+
+```bash
+curl http://localhost:9001/v1/status
+```
+
+**Response (200 OK):**
+```json
+{"node_id":"node-1","role":"leader","leader_id":"node-1"}
+```
+
+### `GET /healthz`
+
+Liveness probe.
+
+**Response: 200 OK** with body `ok`
+
+### Leader forwarding
+
+Writes sent to a follower are automatically reverse-proxied to the current leader. You can safely send writes to **any** node in the cluster. Reads are served locally from any node (may be up to one heartbeat interval stale on followers).
 
 ---
 
-## What's missing
+## Command-line flags
 
-Two pieces stand between "working Raft consensus" and "a usable distributed key-value store":
-
-### 1. The FSM (Finite State Machine)
-
-In Raft, the consensus layer has no opinion about what the replicated data actually _means_: `LogEntry.Command` is deliberately just an opaque `[]byte`. Something has to watch for `commitIndex` advancing past `lastApplied`, decode each newly-committed entry, and apply it to `storage.Store` (a `SET` becomes `store.Set(key, value)`, a `DELETE` becomes `store.Delete(key)`, etc.), then advance `lastApplied` to match.
-
-Without this, committed log entries just sit in the log; they never actually update the key-value data.
-
-### 2. The client-facing API
-
-There's currently no way for anything outside the cluster to send a request at all. This layer needs to:
-
-- Accept `SET`/`GET`/`DELETE` requests from a client (initially another RPC endpoint; later possibly HTTP or gRPC).
-- Route writes to the current leader: if a follower receives a write, it needs to reject it or forward it, since only the leader can safely commit new entries.
-- Wait for the write to actually commit (reach a majority) before acknowledging success back to the client.
-- Serve reads, likely from the leader by default to avoid returning stale data.
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `-id` | Yes | — | Unique node ID (e.g. `node-1`) |
+| `-addr` | Yes | — | Raft TCP listen address (e.g. `localhost:8001`) |
+| `-api-addr` | No | — | HTTP API listen address (e.g. `localhost:9001`). Omit for consensus-only mode. |
+| `-peers` | No | — | Comma-separated `id=host:port` Raft peer addresses |
+| `-api-peers` | No | — | Comma-separated `id=host:port` API peer addresses (needed for leader forwarding) |
+| `-data-dir` | No | `.` | Directory for snapshot files |
 
 ---
 
-## Roadmap
+## Provisioning on a VPS
 
-Concord is intended to be usable in two different ways, and both are planned:
+### With Docker (recommended)
 
-### As a standalone binary (primary goal)
+```bash
+# On your VPS:
+git clone https://github.com/Faithful001/concord.git
+cd concord
+docker compose up --build -d
 
-Users compile or `go install` Concord and run it as its own server process, the same way you'd run etcd, Redis, or Postgres. Multiple processes, one per machine (or one per terminal for local testing), form a cluster. A separate lightweight client (a CLI tool, or a thin client library) talks to the running cluster over the network to actually store and retrieve data.
+# Done. Your cluster is running.
+docker compose logs -f    # watch logs
+docker compose down       # stop
+docker compose down -v    # stop + wipe data
+```
 
-This is the model the project has been built toward from the start, and is the more natural fit for what Concord is: a small, real piece of distributed infrastructure.
+### Without Docker
 
-**Steps needed:**
+```bash
+# Build
+go build -o concord ./cmd/concord
 
-- [ ] Build the FSM, wiring committed entries into `storage.Store`
-- [ ] Build the client-facing API (`internal/api`) with leader-forwarding
-- [ ] Add a minimal client (CLI or library) for sending `SET`/`GET`/`DELETE` requests
-- [ ] Add persistence (write-ahead log to disk) so nodes survive restarts
-- [ ] Package and document a proper `go install` / release flow
+# Run each node (replace IPs with your actual VPS addresses)
+./concord -id node-1 -addr 10.0.0.1:8001 -api-addr 10.0.0.1:9001 \
+  -peers node-2=10.0.0.2:8002,node-3=10.0.0.3:8003 \
+  -api-peers node-2=10.0.0.2:9002,node-3=10.0.0.3:9003 \
+  -data-dir /var/lib/concord
+```
 
-### As an importable Go package (secondary goal)
+### With systemd
 
-Concord's `raft` and `storage` packages should also be usable as a library, allowing another Go program to embed a Concord node directly inside its own process, rather than running Concord as a separate server. This is how libraries like `hashicorp/raft` are commonly used.
+Create `/etc/systemd/system/concord.service`:
 
-**Steps needed:**
+```ini
+[Unit]
+Description=Concord distributed KV store
+After=network.target
 
-- [ ] Design and document a clean, stable public API surface for embedding (constructing a node, wiring a custom transport, registering a custom FSM)
-- [ ] Ensure internal packages that need to be embeddable move out of `internal/` (which cannot be imported by external modules) into an importable location, e.g. `pkg/` or a top-level package
-- [ ] Add Go doc comments throughout for `godoc`/`pkg.go.dev` generation
-- [ ] Publish proper versioned releases (`git tag v0.1.0`, etc.) so `go get` pulls a stable version
+[Service]
+ExecStart=/usr/local/bin/concord \
+  -id node-1 \
+  -addr :8001 \
+  -api-addr :9001 \
+  -peers node-2=10.0.0.2:8002,node-3=10.0.0.3:8003 \
+  -api-peers node-2=10.0.0.2:9002,node-3=10.0.0.3:9003 \
+  -data-dir /var/lib/concord
+Restart=always
+RestartSec=5
 
-### Other future improvements (not yet scheduled)
+[Install]
+WantedBy=multi-user.target
+```
 
-- Snapshotting and log compaction (so the log doesn't grow forever)
-- Cluster membership changes (adding/removing nodes while running)
-- Switching `net/rpc` for gRPC (cross-language compatibility, better tooling)
-- Read-only replica support / linearizable read optimizations
+```bash
+sudo systemctl enable --now concord
+```
 
 ---
 
@@ -281,6 +422,22 @@ A few choices worth explaining, since they weren't the only options:
 - **`Transport` is an interface, satisfied by both `RPCTransport` (real) and, historically, `MockTransport` (an in-process fake used during early development).** This let election and replication logic be built and tested before any real networking existed, and would let a future gRPC-based transport be swapped in without touching `raft` at all.
 - **`net/rpc` over gRPC, for now.** No code generation or protobuf tooling required, keeping the networking footprint lightweight. gRPC remains a straightforward upgrade path if cross-language interoperability is required.
 - **`internal/` for almost everything currently.** Go's `internal/` convention prevents external packages from importing these, which is appropriate while the API surface is still unstable. Packages intended for the "importable library" roadmap goal will need to move out of `internal/` once their public API is deliberately designed, not accidentally exposed.
+- **JSON snapshots over WAL.** Simple, correct, easy to debug (you can read the snapshot file). The tradeoff is that the full log is serialised every snapshot cycle, but for the scale Concord targets this is fast enough. A proper WAL is a straightforward upgrade path.
+- **Leader forwarding via HTTP reverse-proxy.** Simpler than client-side leader discovery + retry logic. Any node in the cluster can accept any request.
+
+---
+
+## Roadmap
+
+### Future improvements (not yet scheduled)
+
+- [ ] Design and document a clean, stable public API surface for embedding (constructing a node, wiring a custom transport, registering a custom FSM)
+- [ ] Ensure internal packages that need to be embeddable move out of `internal/` into an importable location, e.g. `pkg/` or a top-level package
+- [ ] Snapshotting and log compaction (so the log doesn't grow forever)
+- [ ] Cluster membership changes (adding/removing nodes while running)
+- [ ] Switching `net/rpc` for gRPC (cross-language compatibility, better tooling)
+- [ ] Read-only replica support / linearizable read optimizations
+- [ ] Full write-ahead log (WAL) for crash recovery without full-log snapshots
 
 ---
 
