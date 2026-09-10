@@ -84,3 +84,22 @@ func TestEncodeDecodeRemovePeer(t *testing.T) {
 		t.Errorf("got addrs (%q, %q), want empty", gotRaft, gotAPI)
 	}
 }
+
+func TestEncodeDecodeAddLearner(t *testing.T) {
+	id := "node-5"
+	raftAddr := "127.0.0.1:8005"
+	apiAddr := "127.0.0.1:9005"
+
+	encoded := EncodeAddLearner(id, raftAddr, apiAddr)
+	op, gotID, gotRaft, gotAPI, err := DecodePeer(encoded)
+	if err != nil {
+		t.Fatalf("DecodePeer failed: %v", err)
+	}
+
+	if op != OpAddLearner {
+		t.Errorf("op = 0x%02x, want 0x%02x", op, OpAddLearner)
+	}
+	if gotID != id || gotRaft != raftAddr || gotAPI != apiAddr {
+		t.Errorf("DecodePeer = (%q, %q, %q), want (%q, %q, %q)", gotID, gotRaft, gotAPI, id, raftAddr, apiAddr)
+	}
+}

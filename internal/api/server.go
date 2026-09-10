@@ -15,8 +15,10 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -36,6 +38,11 @@ type RaftNode interface {
 	CurrentLeaderID() string
 	Peers() []string
 	Submit(cmd []byte) error
+	IsLearner() bool
+	ReadIndex(ctx context.Context) (int, error)
+	WaitApplied(ctx context.Context, index int) error
+	CommitIndex() int
+	LastApplied() int
 }
 
 // Server is the HTTP API server.
@@ -93,6 +100,7 @@ func (s *Server) Serve(addr string) error {
 func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/kv/", s.handleKV)
+	mux.HandleFunc("/v1/read-index", s.handleReadIndex)
 	mux.HandleFunc("/v1/members", s.handleMembers)
 	mux.HandleFunc("/v1/members/", s.handleMemberDelete)
 	mux.HandleFunc("/v1/status", s.handleStatus)
@@ -123,10 +131,34 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request) {
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
-func (s *Server) doGet(w http.ResponseWriter, _ *http.Request, key string) {
-	// Reads are served locally. Followers may return data that is up to one
-	// heartbeat interval stale. For linearisable reads, clients should target
-	// the leader directly or use /v1/status to discover it.
+func (s *Server) doGet(w http.ResponseWriter, r *http.Request, key string) {
+	linearizable := r.URL.Query().Get("linearizable") == "true" || r.URL.Query().Get("consistent") == "true"
+	if linearizable {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+
+		if s.node.IsLeader() {
+			if _, err := s.node.ReadIndex(ctx); err != nil {
+				if errors.Is(err, raft.ErrNotLeader) {
+					s.forwardToLeader(w, r, nil)
+					return
+				}
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+				return
+			}
+		} else {
+			readIndex, err := s.fetchLeaderReadIndex(ctx)
+			if err != nil {
+				s.forwardToLeader(w, r, nil)
+				return
+			}
+			if err := s.node.WaitApplied(ctx, readIndex); err != nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+				return
+			}
+		}
+	}
+
 	value, err := s.store.Get(key)
 	if errors.Is(err, storage.ErrKeyNotFound) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "key not found"})
@@ -137,6 +169,61 @@ func (s *Server) doGet(w http.ResponseWriter, _ *http.Request, key string) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"key": key, "value": string(value)})
+}
+
+func (s *Server) handleReadIndex(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.node.IsLeader() {
+		s.forwardToLeader(w, r, nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	idx, err := s.node.ReadIndex(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"read_index": idx})
+}
+
+func (s *Server) fetchLeaderReadIndex(ctx context.Context) (int, error) {
+	leaderID := s.node.CurrentLeaderID()
+	if leaderID == "" {
+		return 0, errors.New("no leader known")
+	}
+	s.mu.RLock()
+	apiAddr, ok := s.apiPeers[leaderID]
+	s.mu.RUnlock()
+	if !ok {
+		return 0, errors.New("leader API address not found")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+apiAddr+"/v1/read-index", nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("read-index returned status %d", resp.StatusCode)
+	}
+
+	var res struct {
+		ReadIndex int `json:"read_index"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return 0, err
+	}
+	return res.ReadIndex, nil
 }
 
 func (s *Server) doPut(w http.ResponseWriter, r *http.Request, key string) {
@@ -218,10 +305,11 @@ func (s *Server) handleMemberDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 type MemberInfo struct {
-	ID       string `json:"id"`
-	APIAddr  string `json:"api_addr,omitempty"`
-	IsLeader bool   `json:"is_leader"`
-	IsSelf   bool   `json:"is_self"`
+	ID        string `json:"id"`
+	APIAddr   string `json:"api_addr,omitempty"`
+	IsLeader  bool   `json:"is_leader"`
+	IsSelf    bool   `json:"is_self"`
+	IsLearner bool   `json:"is_learner,omitempty"`
 }
 
 func (s *Server) doGetMembers(w http.ResponseWriter, _ *http.Request) {
@@ -233,9 +321,10 @@ func (s *Server) doGetMembers(w http.ResponseWriter, _ *http.Request) {
 
 	members := make([]MemberInfo, 0, len(peers)+1)
 	members = append(members, MemberInfo{
-		ID:       s.nodeID,
-		IsLeader: s.node.IsLeader(),
-		IsSelf:   true,
+		ID:        s.nodeID,
+		IsLeader:  s.node.IsLeader(),
+		IsSelf:    true,
+		IsLearner: s.node.IsLearner(),
 	})
 
 	for _, p := range peers {
@@ -266,16 +355,23 @@ func (s *Server) doAddMember(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		ID       string `json:"id"`
-		RaftAddr string `json:"raft_addr"`
-		APIAddr  string `json:"api_addr"`
+		ID        string `json:"id"`
+		RaftAddr  string `json:"raft_addr"`
+		APIAddr   string `json:"api_addr"`
+		IsLearner bool   `json:"is_learner"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil || req.ID == "" || req.RaftAddr == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id and raft_addr are required"})
 		return
 	}
 
-	cmd := command.EncodeAddPeer(req.ID, req.RaftAddr, req.APIAddr)
+	var cmd []byte
+	if req.IsLearner {
+		cmd = command.EncodeAddLearner(req.ID, req.RaftAddr, req.APIAddr)
+	} else {
+		cmd = command.EncodeAddPeer(req.ID, req.RaftAddr, req.APIAddr)
+	}
+
 	if err := s.node.Submit(cmd); err != nil {
 		if errors.Is(err, raft.ErrNotLeader) {
 			s.forwardToLeader(w, r, body)
@@ -285,11 +381,12 @@ func (s *Server) doAddMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{
-		"status":    "added",
-		"id":        req.ID,
-		"raft_addr": req.RaftAddr,
-		"api_addr":  req.APIAddr,
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":     "added",
+		"id":         req.ID,
+		"raft_addr":  req.RaftAddr,
+		"api_addr":   req.APIAddr,
+		"is_learner": req.IsLearner,
 	})
 }
 
@@ -317,13 +414,18 @@ func (s *Server) doRemoveMember(w http.ResponseWriter, r *http.Request, id strin
 
 func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	role := "follower"
-	if s.node.IsLeader() {
+	if s.node.IsLearner() {
+		role = "learner"
+	} else if s.node.IsLeader() {
 		role = "leader"
 	}
-	writeJSON(w, http.StatusOK, map[string]string{
-		"node_id":   s.nodeID,
-		"role":      role,
-		"leader_id": s.node.CurrentLeaderID(),
+	writeJSON(w, http.StatusOK, map[string]any{
+		"node_id":      s.nodeID,
+		"role":         role,
+		"leader_id":    s.node.CurrentLeaderID(),
+		"is_learner":   s.node.IsLearner(),
+		"commit_index": s.node.CommitIndex(),
+		"last_applied": s.node.LastApplied(),
 	})
 }
 

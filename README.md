@@ -89,8 +89,9 @@ go build -o bin/cordctl ./cmd/cordctl
 # Write a key
 ./bin/cordctl put hello world
 
-# Read it back
+# Read it back (locally or with linearizable consistency)
 ./bin/cordctl get hello
+./bin/cordctl get hello -l
 
 # Check cluster status and leader info
 ./bin/cordctl status
@@ -98,9 +99,10 @@ go build -o bin/cordctl ./cmd/cordctl
 # Delete a key
 ./bin/cordctl del hello
 
-# Manage cluster membership
+# Manage cluster membership (voting nodes and read-only learner replicas)
 ./bin/cordctl member list
 ./bin/cordctl member add node-4 localhost:8004 localhost:9004
+./bin/cordctl member add node-5 localhost:8005 localhost:9005 --learner
 ./bin/cordctl member remove node-4
 ```
 
@@ -442,6 +444,7 @@ Writes sent to a follower are automatically reverse-proxied to the current leade
 | `-peers` | No | — | Comma-separated `id=host:port` Raft peer addresses |
 | `-api-peers` | No | — | Comma-separated `id=host:port` API peer addresses (needed for leader forwarding) |
 | `-data-dir` | No | `.` | Directory for snapshot files |
+| `-learner` | No | `false` | Run node as a non-voting, read-only learner replica |
 
 ---
 
@@ -525,7 +528,7 @@ A few choices worth explaining, since they weren't the only options:
 - [x] Snapshotting and log compaction (so the log doesn't grow forever)
 - [x] Cluster membership changes (adding/removing nodes while running)
 - [x] Switching `net/rpc` for gRPC (cross-language compatibility, better tooling)
-- [ ] Read-only replica support / linearizable read optimizations
+- [x] Read-only replica support / linearizable read optimizations
 - [ ] Full write-ahead log (WAL) for crash recovery without full-log snapshots
 
 ---

@@ -62,7 +62,7 @@ func (f *FSM) ApplyEntry(msg raft.ApplyMsg) {
 	}
 
 	// Check if this is a membership change command
-	if msg.Command[0] == command.OpAddPeer || msg.Command[0] == command.OpRemovePeer {
+	if msg.Command[0] == command.OpAddPeer || msg.Command[0] == command.OpAddLearner || msg.Command[0] == command.OpRemovePeer {
 		op, id, raftAddr, apiAddr, err := command.DecodePeer(msg.Command)
 		if err != nil {
 			log.Printf("[fsm] membership decode error at index %d: %v", msg.Index, err)

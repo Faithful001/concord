@@ -18,7 +18,7 @@ func (n *Node) RequestVote(args *RequestVoteArgs) *RequestVoteReply {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	if args.Term < n.currentTerm {
+	if args.Term < n.currentTerm || n.isLearner {
 		return &RequestVoteReply{Term: n.currentTerm, VoteGranted: false}
 	}
 
@@ -58,7 +58,7 @@ func (n *Node) startElection(transport Transport) {
 	electionTerm := n.currentTerm
 	lastIndex, lastTerm := n.lastLogIndexAndTerm()
 	candidateID := n.id
-	peers := n.peers
+	votingPeers := n.votingPeersLocked()
 
 	log.Printf("[%s] starting election for term %d", n.id, electionTerm)
 	n.mu.Unlock()
@@ -69,7 +69,7 @@ func (n *Node) startElection(transport Transport) {
 	var votesMu sync.Mutex
 	var wg sync.WaitGroup
 
-	for _, peer := range peers {
+	for _, peer := range votingPeers {
 		wg.Add(1)
 		go func(peer string) {
 			defer wg.Done()
@@ -103,7 +103,7 @@ func (n *Node) startElection(transport Transport) {
 			if reply.VoteGranted {
 				votesMu.Lock()
 				votes++
-				wonMajority := votes*2 > len(peers)+1
+				wonMajority := votes*2 > len(votingPeers)+1
 				votesMu.Unlock()
 
 				if wonMajority && n.role == Candidate {
@@ -243,19 +243,20 @@ func (n *Node) replicateToPeer(peer string, leaderTerm int) {
 // then commits up to N.  Must be called with n.mu held.
 func (n *Node) maybeAdvanceCommitIndex(leaderTerm int) {
 	lastIdx, _ := n.lastLogIndexAndTerm()
+	votingPeers := n.votingPeersLocked()
 	for N := lastIdx; N > n.commitIndex; N-- {
 		term, ok := n.termAt(N)
 		if !ok || term != leaderTerm {
 			continue
 		}
 		count := 1 // leader itself
-		for _, peer := range n.peers {
+		for _, peer := range votingPeers {
 			if n.matchIndex[peer] >= N {
 				count++
 			}
 		}
-		// Majority check (works for any cluster size, including single-node).
-		if count*2 > len(n.peers)+1 {
+		// Majority check on voting members (works for any cluster size, including single-node).
+		if count*2 > len(votingPeers)+1 {
 			old := n.commitIndex
 			n.commitIndex = N
 			log.Printf("[%s] leader committed up to index %d", n.id, N)

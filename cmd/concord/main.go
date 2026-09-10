@@ -24,6 +24,7 @@ func main() {
 	peersFlag := flag.String("peers", "", "comma-separated id=host:port Raft peer addresses, e.g. node-2=:8002,node-3=:8003")
 	apiPeersFlag := flag.String("api-peers", "", "comma-separated id=host:port HTTP API peer addresses, e.g. node-2=:9002,node-3=:9003")
 	dataDir := flag.String("data-dir", ".", "directory for persistent snapshots")
+	learner := flag.Bool("learner", false, "run as a read-only learner replica (non-voting)")
 	flag.Parse()
 
 	if *id == "" || *addr == "" {
@@ -66,6 +67,10 @@ func main() {
 	store := storage.NewStore()
 	rpcTransport := transport.NewRPCTransport(raftAddrs)
 	node := raft.NewNode(*id, peerIDs, rpcTransport)
+	if *learner {
+		node.SetLearner(true)
+		log.Printf("[%s] running as a read-only learner replica", *id)
+	}
 	stateMachine := fsm.New(store)
 
 	var apiServer *api.Server
@@ -76,6 +81,14 @@ func main() {
 	stateMachine.SetMembershipHandler(func(op byte, peerID, raftAddr, apiAddr string) {
 		if op == command.OpAddPeer {
 			node.AddPeer(peerID)
+			if raftAddr != "" {
+				rpcTransport.AddPeer(peerID, raftAddr)
+			}
+			if apiServer != nil && apiAddr != "" {
+				apiServer.AddAPIPeer(peerID, apiAddr)
+			}
+		} else if op == command.OpAddLearner {
+			node.AddLearner(peerID)
 			if raftAddr != "" {
 				rpcTransport.AddPeer(peerID, raftAddr)
 			}

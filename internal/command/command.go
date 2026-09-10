@@ -19,6 +19,7 @@ const (
 	OpDelete     byte = 0x02
 	OpAddPeer    byte = 0x03
 	OpRemovePeer byte = 0x04
+	OpAddLearner byte = 0x05
 )
 
 // ErrInvalidCommand is returned when Decode receives malformed bytes.
@@ -57,6 +58,28 @@ func EncodeAddPeer(id, raftAddr, apiAddr string) []byte {
 
 	buf := make([]byte, 1+4+len(idB)+4+len(raftB)+4+len(apiB))
 	buf[0] = OpAddPeer
+	binary.BigEndian.PutUint32(buf[1:5], uint32(len(idB)))
+	copy(buf[5:], idB)
+
+	off := 5 + len(idB)
+	binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(raftB)))
+	copy(buf[off+4:], raftB)
+
+	off += 4 + len(raftB)
+	binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(apiB)))
+	copy(buf[off+4:], apiB)
+
+	return buf
+}
+
+// EncodeAddLearner returns the wire encoding for adding a read-only learner peer.
+func EncodeAddLearner(id, raftAddr, apiAddr string) []byte {
+	idB := []byte(id)
+	raftB := []byte(raftAddr)
+	apiB := []byte(apiAddr)
+
+	buf := make([]byte, 1+4+len(idB)+4+len(raftB)+4+len(apiB))
+	buf[0] = OpAddLearner
 	binary.BigEndian.PutUint32(buf[1:5], uint32(len(idB)))
 	copy(buf[5:], idB)
 
@@ -112,13 +135,13 @@ func Decode(b []byte) (op byte, key string, value []byte, err error) {
 	return op, key, value, nil
 }
 
-// DecodePeer parses an OpAddPeer or OpRemovePeer command.
+// DecodePeer parses an OpAddPeer, OpAddLearner, or OpRemovePeer command.
 func DecodePeer(b []byte) (op byte, id, raftAddr, apiAddr string, err error) {
 	if len(b) < 5 {
 		return 0, "", "", "", ErrInvalidCommand
 	}
 	op = b[0]
-	if op != OpAddPeer && op != OpRemovePeer {
+	if op != OpAddPeer && op != OpAddLearner && op != OpRemovePeer {
 		return 0, "", "", "", fmt.Errorf("%w: expected peer opcode, got 0x%02x", ErrInvalidCommand, op)
 	}
 
@@ -133,7 +156,7 @@ func DecodePeer(b []byte) (op byte, id, raftAddr, apiAddr string, err error) {
 		return op, id, "", "", nil
 	}
 
-	// OpAddPeer has raftAddr and apiAddr
+	// OpAddPeer and OpAddLearner have raftAddr and apiAddr
 	if len(rest) < 4 {
 		return 0, "", "", "", fmt.Errorf("%w: missing raftAddr length", ErrInvalidCommand)
 	}

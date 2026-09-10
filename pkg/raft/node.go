@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"context"
 	"errors"
 	"log"
 	"math/rand"
@@ -52,6 +53,8 @@ type Node struct {
 	leaderID string
 
 	peers     []string
+	learners  map[string]bool // peer ID -> is learner (read-only replica)
+	isLearner bool            // true if this node itself is a read-only learner
 	transport Transport
 
 	// applyCh is a buffered channel of committed entries destined for the FSM.
@@ -61,6 +64,9 @@ type Node struct {
 	// commitWaiters maps log index → channels to notify when that index commits.
 	// Used by Submit to block until the submitted entry is durable.
 	commitWaiters map[int][]chan error
+
+	// appliedWaiters maps log index -> channels to notify when lastApplied reaches that index.
+	appliedWaiters map[int][]chan struct{}
 
 	resetCh chan struct{}
 	stopCh  chan struct{}
@@ -81,12 +87,43 @@ func NewNode(id string, peers []string, transport Transport) *Node {
 		nextIndex:         make(map[string]int),
 		matchIndex:        make(map[string]int),
 		peers:             peers,
+		learners:          make(map[string]bool),
+		isLearner:         false,
 		transport:         transport,
 		applyCh:           make(chan ApplyMsg, 512),
 		commitWaiters:     make(map[int][]chan error),
+		appliedWaiters:    make(map[int][]chan struct{}),
 		resetCh:           make(chan struct{}, 1),
 		stopCh:            make(chan struct{}),
 	}
+}
+
+// SetLearner sets whether this node itself operates as a read-only learner replica.
+func (n *Node) SetLearner(learner bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.isLearner = learner
+}
+
+// IsLearner reports whether this node is a read-only replica.
+func (n *Node) IsLearner() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.isLearner
+}
+
+// CommitIndex returns the current commit index.
+func (n *Node) CommitIndex() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.commitIndex
+}
+
+// LastApplied returns the current last applied index.
+func (n *Node) LastApplied() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.lastApplied
 }
 
 // Start launches the election timer loop.  Call this after any snapshot
@@ -147,6 +184,24 @@ func (n *Node) AddPeer(id string) {
 	log.Printf("[%s] added peer %s (total peers: %d)", n.id, id, len(n.peers))
 }
 
+// AddLearner registers a peer as a read-only learner replica.
+func (n *Node) AddLearner(id string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	n.learners[id] = true
+	for _, p := range n.peers {
+		if p == id {
+			return
+		}
+	}
+	n.peers = append(n.peers, id)
+	lastIdx, _ := n.lastLogIndexAndTerm()
+	n.nextIndex[id] = lastIdx + 1
+	n.matchIndex[id] = 0
+	log.Printf("[%s] added learner %s (total peers: %d)", n.id, id, len(n.peers))
+}
+
 // RemovePeer removes a peer ID from the cluster membership dynamically.
 func (n *Node) RemovePeer(id string) {
 	n.mu.Lock()
@@ -159,11 +214,139 @@ func (n *Node) RemovePeer(id string) {
 		}
 	}
 	n.peers = filtered
+	delete(n.learners, id)
 	delete(n.nextIndex, id)
 	delete(n.matchIndex, id)
 	log.Printf("[%s] removed peer %s (total peers: %d)", n.id, id, len(n.peers))
 }
 
+// IsPeerLearner reports whether a peer is marked as a learner.
+func (n *Node) IsPeerLearner(id string) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.learners[id]
+}
+
+// votingPeersLocked returns the voting peers (excluding learners). Must be called with n.mu held.
+func (n *Node) votingPeersLocked() []string {
+	v := make([]string, 0, len(n.peers))
+	for _, p := range n.peers {
+		if !n.learners[p] {
+			v = append(v, p)
+		}
+	}
+	return v
+}
+
+// ReadIndex executes the ReadIndex protocol (§8) to obtain a verified linearizable
+// read index from the cluster leader.
+func (n *Node) ReadIndex(ctx context.Context) (int, error) {
+	n.mu.Lock()
+	if n.role != Leader {
+		n.mu.Unlock()
+		return 0, ErrNotLeader
+	}
+	term := n.currentTerm
+	readIndex := n.commitIndex
+	votingPeers := n.votingPeersLocked()
+	n.mu.Unlock()
+
+	// If leader is the only voting member, leadership is guaranteed
+	if len(votingPeers) > 0 {
+		type heartbeatResult struct {
+			success bool
+			term    int
+		}
+		resCh := make(chan heartbeatResult, len(votingPeers))
+		for _, peer := range votingPeers {
+			go func(p string) {
+				n.mu.Lock()
+				leaderID := n.id
+				prevLogIdx := n.nextIndex[p] - 1
+				prevLogTerm, _ := n.termAt(prevLogIdx)
+				cIdx := n.commitIndex
+				n.mu.Unlock()
+
+				reply, err := n.transport.SendAppendEntries(p, &AppendEntriesArgs{
+					Term:              term,
+					LeaderID:          leaderID,
+					PrevLogIndex:      prevLogIdx,
+					PrevLogTerm:       prevLogTerm,
+					Entries:           nil,
+					LeaderCommitIndex: cIdx,
+				})
+				if err != nil {
+					resCh <- heartbeatResult{success: false}
+					return
+				}
+				resCh <- heartbeatResult{success: reply.Success, term: reply.Term}
+			}(peer)
+		}
+
+		ackCount := 0
+		responded := 0
+		success := false
+
+		for responded < len(votingPeers) {
+			select {
+			case res := <-resCh:
+				responded++
+				if res.term > term {
+					n.mu.Lock()
+					if res.term > n.currentTerm {
+						n.currentTerm = res.term
+						n.role = Follower
+						n.votedFor = ""
+						n.clearCommitWaiters(ErrNotLeader)
+					}
+					n.mu.Unlock()
+					return 0, ErrNotLeader
+				}
+				if res.success {
+					ackCount++
+					if (ackCount+1)*2 > len(votingPeers)+1 {
+						success = true
+					}
+				}
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			}
+			if success {
+				break
+			}
+		}
+
+		if !success {
+			return 0, errors.New("raft: failed to achieve quorum for linearizable read")
+		}
+	}
+
+	// Wait until lastApplied >= readIndex
+	if err := n.WaitApplied(ctx, readIndex); err != nil {
+		return 0, err
+	}
+
+	return readIndex, nil
+}
+
+// WaitApplied blocks until lastApplied is at least index or ctx is canceled.
+func (n *Node) WaitApplied(ctx context.Context, index int) error {
+	n.mu.Lock()
+	if n.lastApplied >= index {
+		n.mu.Unlock()
+		return nil
+	}
+	ch := make(chan struct{}, 1)
+	n.appliedWaiters[index] = append(n.appliedWaiters[index], ch)
+	n.mu.Unlock()
+
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 // Submit appends cmd to the Raft log and blocks until the entry commits (i.e.
 // a majority of nodes have written it) or a timeout occurs.
@@ -277,11 +460,15 @@ func (n *Node) electionTimerLoop() {
 		case <-timer.C:
 			n.mu.Lock()
 			role := n.role
+			isLearner := n.isLearner
 			n.mu.Unlock()
 
-			log.Printf("[%s] election timeout fired (role=%s)", n.id, role)
-			if role != Leader {
-				n.startElection(n.transport)
+			// Learners (read-only replicas) never seek election
+			if !isLearner {
+				log.Printf("[%s] election timeout fired (role=%s)", n.id, role)
+				if role != Leader {
+					n.startElection(n.transport)
+				}
 			}
 			timer.Reset(randomElectionTimeout())
 
@@ -316,12 +503,29 @@ func (n *Node) sendToApplyCh(from, to int) {
 		entries = append(entries, n.log[offset])
 	}
 	n.lastApplied = to
+	n.notifyAppliedWaiters(to)
 	if len(entries) > 0 {
 		go func() {
 			for _, e := range entries {
 				n.applyCh <- ApplyMsg{Index: e.Index, Command: e.Command}
 			}
 		}()
+	}
+}
+
+// notifyAppliedWaiters notifies callers waiting for lastApplied >= idx.
+// Must be called with n.mu held.
+func (n *Node) notifyAppliedWaiters(upToIndex int) {
+	for idx, waiters := range n.appliedWaiters {
+		if idx <= upToIndex {
+			for _, ch := range waiters {
+				select {
+				case ch <- struct{}{}:
+				default:
+				}
+			}
+			delete(n.appliedWaiters, idx)
+		}
 	}
 }
 

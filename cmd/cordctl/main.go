@@ -25,17 +25,22 @@ func main() {
 	endpointFlag := flag.String("endpoint", "", "Concord API endpoint URL (default: http://localhost:9001 or $CORDCTL_ENDPOINT)")
 	flag.StringVar(endpointFlag, "e", "", "Shorthand for --endpoint")
 
+	linearizableFlag := flag.Bool("linearizable", false, "Ensure strongly consistent / linearizable read via ReadIndex protocol")
+	flag.BoolVar(linearizableFlag, "l", false, "Shorthand for --linearizable")
+
+	learnerFlag := flag.Bool("learner", false, "Add node as a non-voting read-only learner replica")
+
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: cordctl [options] <command> [args...]\n\n")
 		fmt.Fprintf(os.Stderr, "Commands:\n")
-		fmt.Fprintf(os.Stderr, "  put <key> <value>                  Write a key-value pair\n")
-		fmt.Fprintf(os.Stderr, "  get <key>                          Read the value for a key\n")
-		fmt.Fprintf(os.Stderr, "  del <key>                          Delete a key\n")
-		fmt.Fprintf(os.Stderr, "  status                             Check cluster status and leader info\n")
-		fmt.Fprintf(os.Stderr, "  health                             Check node health\n")
-		fmt.Fprintf(os.Stderr, "  member list                        List all cluster members\n")
-		fmt.Fprintf(os.Stderr, "  member add <id> <raft> [api]       Add a new node to the cluster\n")
-		fmt.Fprintf(os.Stderr, "  member remove <id>                 Remove a node from the cluster\n\n")
+		fmt.Fprintf(os.Stderr, "  put <key> <value>                    Write a key-value pair\n")
+		fmt.Fprintf(os.Stderr, "  get <key> [-l|--linearizable]        Read the value for a key (optional linearizable read)\n")
+		fmt.Fprintf(os.Stderr, "  del <key>                            Delete a key\n")
+		fmt.Fprintf(os.Stderr, "  status                               Check cluster status and leader info\n")
+		fmt.Fprintf(os.Stderr, "  health                               Check node health\n")
+		fmt.Fprintf(os.Stderr, "  member list                          List all cluster members\n")
+		fmt.Fprintf(os.Stderr, "  member add <id> <raft> [api] [--learner]  Add a new node or learner replica to the cluster\n")
+		fmt.Fprintf(os.Stderr, "  member remove <id>                   Remove a node from the cluster\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 	}
@@ -57,7 +62,7 @@ func main() {
 	}
 	endpoint = strings.TrimRight(endpoint, "/")
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: 6 * time.Second}
 
 	switch args[0] {
 	case "put", "set":
@@ -70,11 +75,18 @@ func main() {
 
 	case "get":
 		if len(args) < 2 {
-			fmt.Fprintf(os.Stderr, "Error: 'get' requires <key>\nUsage: cordctl get <key>\n")
+			fmt.Fprintf(os.Stderr, "Error: 'get' requires <key>\nUsage: cordctl get <key> [-l|--linearizable]\n")
 			os.Exit(1)
 		}
 		key := args[1]
-		getKey(client, endpoint, key)
+		// check if trailing flags were provided after command
+		isLin := *linearizableFlag
+		for _, a := range args[2:] {
+			if a == "-l" || a == "--linearizable" {
+				isLin = true
+			}
+		}
+		getKey(client, endpoint, key, isLin)
 
 	case "del", "delete", "rm":
 		if len(args) < 2 {
@@ -100,15 +112,20 @@ func main() {
 			listMembers(client, endpoint)
 		case "add":
 			if len(args) < 4 {
-				fmt.Fprintf(os.Stderr, "Error: 'member add' requires <id> and <raft_addr>\nUsage: cordctl member add <id> <raft_addr> [api_addr]\n")
+				fmt.Fprintf(os.Stderr, "Error: 'member add' requires <id> and <raft_addr>\nUsage: cordctl member add <id> <raft_addr> [api_addr] [--learner]\n")
 				os.Exit(1)
 			}
 			id, raftAddr := args[2], args[3]
 			apiAddr := ""
-			if len(args) >= 5 {
-				apiAddr = args[4]
+			isLearner := *learnerFlag
+			for _, a := range args[4:] {
+				if a == "--learner" {
+					isLearner = true
+				} else if !strings.HasPrefix(a, "-") && apiAddr == "" {
+					apiAddr = a
+				}
 			}
-			addMember(client, endpoint, id, raftAddr, apiAddr)
+			addMember(client, endpoint, id, raftAddr, apiAddr, isLearner)
 		case "remove", "rm", "del", "delete":
 			if len(args) < 3 {
 				fmt.Fprintf(os.Stderr, "Error: 'member remove' requires <id>\nUsage: cordctl member remove <id>\n")
@@ -126,7 +143,6 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
-
 }
 
 func putKey(client *http.Client, endpoint, key, val string) {
@@ -160,8 +176,11 @@ func putKey(client *http.Client, endpoint, key, val string) {
 	}
 }
 
-func getKey(client *http.Client, endpoint, key string) {
+func getKey(client *http.Client, endpoint, key string, linearizable bool) {
 	url := fmt.Sprintf("%s/v1/kv/%s", endpoint, key)
+	if linearizable {
+		url += "?linearizable=true"
+	}
 	resp, err := client.Get(url)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Request error: %v\n", err)
@@ -276,12 +295,13 @@ func listMembers(client *http.Client, endpoint string) {
 	}
 }
 
-func addMember(client *http.Client, endpoint, id, raftAddr, apiAddr string) {
+func addMember(client *http.Client, endpoint, id, raftAddr, apiAddr string, isLearner bool) {
 	url := fmt.Sprintf("%s/v1/members", endpoint)
-	payload := map[string]string{
-		"id":        id,
-		"raft_addr": raftAddr,
-		"api_addr":  apiAddr,
+	payload := map[string]any{
+		"id":         id,
+		"raft_addr":  raftAddr,
+		"api_addr":   apiAddr,
+		"is_learner": isLearner,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -298,7 +318,11 @@ func addMember(client *http.Client, endpoint, id, raftAddr, apiAddr string) {
 
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		fmt.Printf("Member %s added successfully.\n", id)
+		roleType := "member"
+		if isLearner {
+			roleType = "learner replica"
+		}
+		fmt.Printf("Cluster %s %s added successfully.\n", roleType, id)
 	} else {
 		fmt.Fprintf(os.Stderr, "Error (%d): %s\n", resp.StatusCode, string(respBody))
 		os.Exit(1)
@@ -328,4 +352,3 @@ func removeMember(client *http.Client, endpoint, id string) {
 		os.Exit(1)
 	}
 }
-
