@@ -18,4 +18,3 @@ type SnapshotState struct {
 	CommitIndex       int
 	Data              map[string][]byte
 }
-

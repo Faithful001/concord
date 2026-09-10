@@ -15,8 +15,10 @@ import (
 )
 
 const (
-	OpSet    byte = 0x01
-	OpDelete byte = 0x02
+	OpSet        byte = 0x01
+	OpDelete     byte = 0x02
+	OpAddPeer    byte = 0x03
+	OpRemovePeer byte = 0x04
 )
 
 // ErrInvalidCommand is returned when Decode receives malformed bytes.
@@ -44,6 +46,38 @@ func EncodeDelete(key string) []byte {
 	buf[0] = OpDelete
 	binary.BigEndian.PutUint32(buf[1:5], uint32(len(kb)))
 	copy(buf[5:], kb)
+	return buf
+}
+
+// EncodeAddPeer returns the wire encoding for adding a cluster peer.
+func EncodeAddPeer(id, raftAddr, apiAddr string) []byte {
+	idB := []byte(id)
+	raftB := []byte(raftAddr)
+	apiB := []byte(apiAddr)
+
+	buf := make([]byte, 1+4+len(idB)+4+len(raftB)+4+len(apiB))
+	buf[0] = OpAddPeer
+	binary.BigEndian.PutUint32(buf[1:5], uint32(len(idB)))
+	copy(buf[5:], idB)
+
+	off := 5 + len(idB)
+	binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(raftB)))
+	copy(buf[off+4:], raftB)
+
+	off += 4 + len(raftB)
+	binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(apiB)))
+	copy(buf[off+4:], apiB)
+
+	return buf
+}
+
+// EncodeRemovePeer returns the wire encoding for removing a cluster peer.
+func EncodeRemovePeer(id string) []byte {
+	idB := []byte(id)
+	buf := make([]byte, 1+4+len(idB))
+	buf[0] = OpRemovePeer
+	binary.BigEndian.PutUint32(buf[1:5], uint32(len(idB)))
+	copy(buf[5:], idB)
 	return buf
 }
 
@@ -77,3 +111,48 @@ func Decode(b []byte) (op byte, key string, value []byte, err error) {
 	}
 	return op, key, value, nil
 }
+
+// DecodePeer parses an OpAddPeer or OpRemovePeer command.
+func DecodePeer(b []byte) (op byte, id, raftAddr, apiAddr string, err error) {
+	if len(b) < 5 {
+		return 0, "", "", "", ErrInvalidCommand
+	}
+	op = b[0]
+	if op != OpAddPeer && op != OpRemovePeer {
+		return 0, "", "", "", fmt.Errorf("%w: expected peer opcode, got 0x%02x", ErrInvalidCommand, op)
+	}
+
+	idLen := binary.BigEndian.Uint32(b[1:5])
+	if uint32(len(b)) < 5+idLen {
+		return 0, "", "", "", fmt.Errorf("%w: truncated peer id", ErrInvalidCommand)
+	}
+	id = string(b[5 : 5+idLen])
+	rest := b[5+idLen:]
+
+	if op == OpRemovePeer {
+		return op, id, "", "", nil
+	}
+
+	// OpAddPeer has raftAddr and apiAddr
+	if len(rest) < 4 {
+		return 0, "", "", "", fmt.Errorf("%w: missing raftAddr length", ErrInvalidCommand)
+	}
+	raftLen := binary.BigEndian.Uint32(rest[:4])
+	if uint32(len(rest)) < 4+raftLen {
+		return 0, "", "", "", fmt.Errorf("%w: truncated raftAddr", ErrInvalidCommand)
+	}
+	raftAddr = string(rest[4 : 4+raftLen])
+	rest = rest[4+raftLen:]
+
+	if len(rest) < 4 {
+		return 0, "", "", "", fmt.Errorf("%w: missing apiAddr length", ErrInvalidCommand)
+	}
+	apiLen := binary.BigEndian.Uint32(rest[:4])
+	if uint32(len(rest)) < 4+apiLen {
+		return 0, "", "", "", fmt.Errorf("%w: truncated apiAddr", ErrInvalidCommand)
+	}
+	apiAddr = string(rest[4 : 4+apiLen])
+
+	return op, id, raftAddr, apiAddr, nil
+}
+

@@ -207,7 +207,6 @@ func (n *Node) RestoreSnapshot(snap SnapshotState) {
 		n.id, n.currentTerm, n.lastIncludedIndex, len(n.log), n.commitIndex)
 }
 
-
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 // resetElectionTimeout signals the timer goroutine to reset without firing.

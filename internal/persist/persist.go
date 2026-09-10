@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/Faithful001/concord.git/internal/raft"
+	"github.com/Faithful001/concord.git/pkg/raft"
 )
 
 // Snapshot is the serialisable form of a node's persistent Raft state.

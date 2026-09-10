@@ -33,7 +33,7 @@ func (n *Node) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 		}
 	}
 
-// §5.3: merge entries into our log.
+	// §5.3: merge entries into our log.
 	for _, entry := range args.Entries {
 		if entry.Index <= n.lastIncludedIndex {
 			continue // already compacted into snapshot

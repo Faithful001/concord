@@ -4,7 +4,7 @@ import (
 	"net"
 	"net/rpc"
 
-	"github.com/Faithful001/concord.git/internal/raft"
+	"github.com/Faithful001/concord.git/pkg/raft"
 	rpcSvc "github.com/Faithful001/concord.git/internal/rpc"
 )
 

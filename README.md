@@ -78,7 +78,28 @@ cd concord
 docker compose up --build
 ```
 
-This starts a 3-node cluster. Within a second, one node wins the election. Then:
+This starts a 3-node cluster. Within a second, one node wins the election.
+
+#### Using `cordctl` CLI (Recommended)
+
+```bash
+# Build CLI
+go build -o bin/cordctl ./cmd/cordctl
+
+# Write a key
+./bin/cordctl put hello world
+
+# Read it back
+./bin/cordctl get hello
+
+# Check cluster status and leader info
+./bin/cordctl status
+
+# Delete a key
+./bin/cordctl del hello
+```
+
+#### Using `curl`
 
 ```bash
 # Write a key
@@ -173,7 +194,7 @@ go install github.com/Faithful001/concord.git/cmd/concord@latest
 └─────────────────┘           └───────────────────┘
 ```
 
-**The core design principle:** `internal/raft` is completely decoupled from networking. It defines a `Transport` interface (just two methods: send a vote request, send an append-entries request) and depends only on that interface, never on `net/rpc`, TCP, or any concrete networking detail. This is what let the project be built and tested with an in-memory fake transport first, before real networking existed, and what would let `net/rpc` be swapped for gRPC later without touching a single line of consensus logic.
+**The core design principle:** `pkg/raft` is completely decoupled from networking (just like `etcd/raft`). It defines a `Transport` interface (just two methods: send a vote request, send an append-entries request) and depends only on that interface, never on `net/rpc`, TCP, or any concrete networking detail. This is what let the project be built and tested with an in-memory fake transport first, before real networking existed, and what lets external Go applications import `pkg/raft` to build their own distributed state machines.
 
 ---
 
@@ -181,13 +202,17 @@ go install github.com/Faithful001/concord.git/cmd/concord@latest
 
 ### `cmd/concord/`
 
-The entry point. Parses command-line flags (`-id`, `-addr`, `-api-addr`, `-peers`, `-api-peers`, `-data-dir`), constructs a `Node` and its `Transport`, restores any saved snapshot, starts the FSM goroutine and periodic snapshot saver, starts the HTTP API server, and blocks forever.
+The standalone server entry point. Parses command-line flags (`-id`, `-addr`, `-api-addr`, `-peers`, `-api-peers`, `-data-dir`), constructs a `Node` and its `Transport`, restores any saved snapshot, starts the FSM goroutine and periodic snapshot saver, starts the HTTP API server, and blocks forever.
 
-### `internal/raft/`
+### `cmd/cordctl/`
 
-The heart of the project: Raft consensus, with zero networking knowledge.
+The standalone CLI client utility (in the spirit of `etcdctl`). Interacts directly with the Concord cluster over HTTP to `put`, `get`, `del`, check `status`, and test `health`.
 
-- **`node.go`**: the `Node` struct: all persistent state (`currentTerm`, `votedFor`, `log`), volatile state (`commitIndex`, `lastApplied`), and leader-only state (`nextIndex`, `matchIndex`). Also: `Submit()` (leader appends a command and waits for commit), `TakeSnapshot()` / `RestoreSnapshot()`, `ApplyCh()`, the commit waiter system, and the election timer goroutine.
+### `pkg/raft/`
+
+The exported, reusable Raft consensus engine with zero networking dependencies. External Go applications can import `github.com/Faithful001/concord.git/pkg/raft` to embed Raft into custom applications.
+
+- **`node.go`**: the `Node` struct: all persistent state (`currentTerm`, `votedFor`, `log`), volatile state (`commitIndex`, `lastApplied`), snapshot metadata (`lastIncludedIndex`, `lastIncludedTerm`), and leader-only state (`nextIndex`, `matchIndex`). Also: `Submit()` (leader appends a command and waits for commit), `TakeSnapshot()` / `RestoreSnapshot()`, `ApplyCh()`, the commit waiter system, and the election timer goroutine.
 - **`role.go`**: the `Role` type (`Follower`, `Candidate`, `Leader`), a string-based enum for readable logging.
 - **`election.go`**: `RequestVote` (the vote-granting handler), `startElection`/`becomeLeader` (the candidate-side logic), `sendHeartbeats` (the leader's replication loop), `replicateToPeer` (sends missing entries + handles matchIndex), and `maybeAdvanceCommitIndex` (the commit-point calculation).
 - **`replication.go`**: `AppendEntries` (the follower-side consistency check, conflict detection/log truncation, and commit-index advancement with FSM notification).
@@ -449,8 +474,8 @@ A few choices worth explaining, since they weren't the only options:
 
 ### Future improvements (not yet scheduled)
 
-- [ ] Design and document a clean, stable public API surface for embedding (constructing a node, wiring a custom transport, registering a custom FSM)
-- [ ] Ensure internal packages that need to be embeddable move out of `internal/` into an importable location, e.g. `pkg/` or a top-level package
+- [x] Export standalone Raft consensus engine (`pkg/raft`) for embedding in custom applications
+- [x] Standalone CLI client tool (`cmd/cordctl`) for managing clusters
 - [x] Snapshotting and log compaction (so the log doesn't grow forever)
 - [ ] Cluster membership changes (adding/removing nodes while running)
 - [ ] Switching `net/rpc` for gRPC (cross-language compatibility, better tooling)

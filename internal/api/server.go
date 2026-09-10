@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/Faithful001/concord.git/internal/command"
-	"github.com/Faithful001/concord.git/internal/raft"
+	"github.com/Faithful001/concord.git/pkg/raft"
 	"github.com/Faithful001/concord.git/internal/storage"
 )
 

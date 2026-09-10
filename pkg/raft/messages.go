@@ -16,16 +16,16 @@ type RequestVoteReply struct {
 
 // AppendEntriesArgs is sent by the leader to replicate log entries or send heartbeats.
 type AppendEntriesArgs struct {
-	Term         		int
-	LeaderID     		string
-	PrevLogIndex 		int
-	PrevLogTerm  		int
-	Entries      		[]LogEntry
-	LeaderCommitIndex 	int
+	Term              int
+	LeaderID          string
+	PrevLogIndex      int
+	PrevLogTerm       int
+	Entries           []LogEntry
+	LeaderCommitIndex int
 }
 
 // AppendEntriesReply is sent by a follower in response to an AppendEntriesArgs.
 type AppendEntriesReply struct {
-	Term    	int
+	Term    int
 	Success bool
 }

@@ -4,7 +4,7 @@ import (
 	"net/rpc"
 	"sync"
 
-	"github.com/Faithful001/concord.git/internal/raft"
+	"github.com/Faithful001/concord.git/pkg/raft"
 )
 
 type RPCTransport struct {

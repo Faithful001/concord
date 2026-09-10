@@ -1,8 +1,9 @@
 BINARY := concord
+CLI_BINARY := cordctl
 BIN_DIR := bin
 DATA_DIR := data
 
-.PHONY: all build test fmt vet clean \
+.PHONY: all build build-server build-ctl test fmt vet clean \
         run-node1 run-node2 run-node3 \
         docker-build docker-up docker-down docker-logs
 
@@ -10,10 +11,17 @@ DATA_DIR := data
 
 all: build
 
-## build: compile the binary to ./bin/concord
-build:
+## build: compile concord server and cordctl CLI
+build: build-server build-ctl
+
+build-server:
 	@mkdir -p $(BIN_DIR)
 	go build -o $(BIN_DIR)/$(BINARY) ./cmd/concord
+
+build-ctl:
+	@mkdir -p $(BIN_DIR)
+	go build -o $(BIN_DIR)/$(CLI_BINARY) ./cmd/cordctl
+
 
 ## test: run all tests
 test:

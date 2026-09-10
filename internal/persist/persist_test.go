@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/Faithful001/concord.git/internal/raft"
+	"github.com/Faithful001/concord.git/pkg/raft"
 )
 
 func TestSaveAndLoadSnapshot(t *testing.T) {

@@ -1,6 +1,6 @@
 package rpc
 
-import "github.com/Faithful001/concord.git/internal/raft"
+import "github.com/Faithful001/concord.git/pkg/raft"
 
 // RPCService adapts Node's direct-return methods to net/rpc's func(args, *reply) error signature.
 

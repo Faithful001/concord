@@ -7,10 +7,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Faithful001/concord.git/pkg/raft"
 	"github.com/Faithful001/concord.git/internal/api"
 	"github.com/Faithful001/concord.git/internal/fsm"
 	"github.com/Faithful001/concord.git/internal/persist"
-	"github.com/Faithful001/concord.git/internal/raft"
 	"github.com/Faithful001/concord.git/internal/storage"
 	"github.com/Faithful001/concord.git/internal/transport"
 )
