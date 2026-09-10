@@ -2,7 +2,7 @@
 
 A distributed key-value store built on Raft consensus, providing strong consistency and fault tolerance across nodes.
 
-Concord replicates data across multiple machines and keeps working correctly even when some of them crash or the network between them misbehaves. It implements the [Raft consensus algorithm](https://raft.github.io/raft.pdf) from scratch: leader election, log replication, and safety, as the foundation for a small, understandable distributed KV store, in the spirit of systems like etcd.
+Concord is a lightweight, **etcd-inspired** distributed key-value store built from scratch in Go. It keeps data consistent and safely replicated across a cluster, continuing to work reliably even when servers fail or network connections drop. Under the hood, Concord implements the [Raft consensus algorithm](https://raft.github.io/raft.pdf)—complete with leader election, log replication, snapshots, dynamic cluster membership, linearizable reads, and a Write-Ahead Log (WAL) for crash recovery.
 
 ---
 
