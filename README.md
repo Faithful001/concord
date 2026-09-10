@@ -529,7 +529,7 @@ A few choices worth explaining, since they weren't the only options:
 - [x] Cluster membership changes (adding/removing nodes while running)
 - [x] Switching `net/rpc` for gRPC (cross-language compatibility, better tooling)
 - [x] Read-only replica support / linearizable read optimizations
-- [ ] Full write-ahead log (WAL) for crash recovery without full-log snapshots
+- [x] Full write-ahead log (WAL) for crash recovery without full-log snapshots
 
 ---
 

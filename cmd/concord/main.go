@@ -13,6 +13,7 @@ import (
 	"github.com/Faithful001/concord.git/internal/persist"
 	"github.com/Faithful001/concord.git/internal/storage"
 	"github.com/Faithful001/concord.git/internal/transport"
+	"github.com/Faithful001/concord.git/internal/wal"
 	"github.com/Faithful001/concord.git/pkg/raft"
 )
 
@@ -63,6 +64,13 @@ func main() {
 		log.Fatalf("[%s] failed to load snapshot: %v", *id, err)
 	}
 
+	// ── Open WAL ──────────────────────────────────────────────────────────────
+	w, err := wal.Open(*dataDir, *id)
+	if err != nil {
+		log.Fatalf("[%s] failed to open WAL: %v", *id, err)
+	}
+	defer w.Close()
+
 	// ── Build components ──────────────────────────────────────────────────────
 	store := storage.NewStore()
 	rpcTransport := transport.NewRPCTransport(raftAddrs)
@@ -105,24 +113,64 @@ func main() {
 	})
 
 	// ── Restore snapshot ──────────────────────────────────────────────────────
+	var snapState raft.SnapshotState
 	if snap != nil {
-		node.RestoreSnapshot(snap.ToSnapshotState())
+		snapState = snap.ToSnapshotState()
+	}
+
+	// ── Replay WAL on top of snapshot ─────────────────────────────────────────
+	// Recover any entries (and hard-state) that were written since the last
+	// snapshot but not yet included in it (i.e. were lost if we crash-looped).
+	walHS, walEntries, err := w.ReadAll()
+	if err != nil {
+		log.Fatalf("[%s] WAL replay failed: %v", *id, err)
+	}
+	if walHS != nil {
+		if walHS.Term > snapState.CurrentTerm {
+			snapState.CurrentTerm = walHS.Term
+		}
+		if walHS.VotedFor != "" {
+			snapState.VotedFor = walHS.VotedFor
+		}
+	}
+	for _, e := range walEntries {
+		if e.Index > snapState.LastIncludedIndex {
+			snapState.Log = append(snapState.Log, e)
+		}
+	}
+	walRecovered := len(walEntries)
+
+	if snap != nil || walRecovered > 0 {
+		node.RestoreSnapshot(snapState)
 
 		// Restore in-memory key-value data directly from the snapshot
-		if snap.Data != nil {
+		if snap != nil && snap.Data != nil {
 			stateMachine.Restore(snap.Data)
 		}
 
-		// Replay any remaining committed entries in the log past LastIncludedIndex
-		for _, entry := range snap.Log {
-			if entry.Index > snap.LastIncludedIndex && entry.Index <= snap.CommitIndex {
+		// Replay committed entries that were in the snapshot log or recovered from WAL
+		for _, entry := range snapState.Log {
+			if entry.Index > snapState.LastIncludedIndex && entry.Index <= snapState.CommitIndex {
 				stateMachine.ApplyEntry(raft.ApplyMsg{
 					Index:   entry.Index,
 					Command: entry.Command,
 				})
 			}
 		}
-		log.Printf("[%s] snapshot restored: lastIncludedIndex=%d commitIndex=%d", *id, snap.LastIncludedIndex, snap.CommitIndex)
+		log.Printf("[%s] recovery complete: snap=%v walEntries=%d term=%d commitIndex=%d",
+			*id, snap != nil, walRecovered, snapState.CurrentTerm, snapState.CommitIndex)
+	}
+
+	// ── Wire WAL hooks ────────────────────────────────────────────────────────
+	node.OnHardStateChange = func(term int, votedFor string) {
+		if err := w.AppendHardState(term, votedFor); err != nil {
+			log.Printf("[%s] WAL hard-state write error: %v", *id, err)
+		}
+	}
+	node.OnLogAppend = func(entries []raft.LogEntry) {
+		if err := w.AppendEntries(entries); err != nil {
+			log.Printf("[%s] WAL entry write error: %v", *id, err)
+		}
 	}
 
 	// ── Start FSM goroutine ───────────────────────────────────────────────────
@@ -138,9 +186,13 @@ func main() {
 			state := node.TakeSnapshot(kvData)
 			if saveErr := persist.Save(*dataDir, *id, persist.FromSnapshotState(state)); saveErr != nil {
 				log.Printf("[%s] snapshot save error: %v", *id, saveErr)
-			} else {
-				log.Printf("[%s] snapshot saved (term=%d lastIncludedIndex=%d remainingLog=%d commitIndex=%d)",
-					*id, state.CurrentTerm, state.LastIncludedIndex, len(state.Log), state.CommitIndex)
+				continue
+			}
+			log.Printf("[%s] snapshot saved (term=%d lastIncludedIndex=%d remainingLog=%d commitIndex=%d)",
+				*id, state.CurrentTerm, state.LastIncludedIndex, len(state.Log), state.CommitIndex)
+			// Truncate WAL: only keep log entries after the new snapshot boundary.
+			if truncErr := w.Truncate(state.Log); truncErr != nil {
+				log.Printf("[%s] WAL truncate error: %v", *id, truncErr)
 			}
 		}
 	}()

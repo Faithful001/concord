@@ -23,6 +23,9 @@ func (n *Node) RequestVote(args *RequestVoteArgs) *RequestVoteReply {
 	}
 
 	if args.Term > n.currentTerm {
+		if n.OnHardStateChange != nil {
+			n.OnHardStateChange(args.Term, "")
+		}
 		n.currentTerm = args.Term
 		n.role = Follower
 		n.votedFor = ""
@@ -36,6 +39,9 @@ func (n *Node) RequestVote(args *RequestVoteArgs) *RequestVoteReply {
 
 	voteGranted := false
 	if (n.votedFor == "" || n.votedFor == args.CandidateID) && candidateUpToDate {
+		if n.OnHardStateChange != nil {
+			n.OnHardStateChange(n.currentTerm, args.CandidateID)
+		}
 		n.votedFor = args.CandidateID
 		n.role = Follower
 		voteGranted = true
@@ -51,6 +57,9 @@ func (n *Node) RequestVote(args *RequestVoteArgs) *RequestVoteReply {
 func (n *Node) startElection(transport Transport) {
 	n.mu.Lock()
 
+	if n.OnHardStateChange != nil {
+		n.OnHardStateChange(n.currentTerm+1, n.id)
+	}
 	n.currentTerm++
 	n.role = Candidate
 	n.leaderID = ""
@@ -93,6 +102,9 @@ func (n *Node) startElection(transport Transport) {
 			}
 
 			if reply.Term > n.currentTerm {
+				if n.OnHardStateChange != nil {
+					n.OnHardStateChange(reply.Term, "")
+				}
 				n.currentTerm = reply.Term
 				n.role = Follower
 				n.votedFor = ""
@@ -216,6 +228,9 @@ func (n *Node) replicateToPeer(peer string, leaderTerm int) {
 
 	if reply.Term > n.currentTerm {
 		// Discovered a higher term — step down.
+		if n.OnHardStateChange != nil {
+			n.OnHardStateChange(reply.Term, "")
+		}
 		n.currentTerm = reply.Term
 		n.role = Follower
 		n.votedFor = ""

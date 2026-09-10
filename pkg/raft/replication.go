@@ -15,6 +15,9 @@ func (n *Node) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 
 	// Higher or equal term from a valid leader — update term and step down.
 	if args.Term > n.currentTerm {
+		if n.OnHardStateChange != nil {
+			n.OnHardStateChange(args.Term, "")
+		}
 		n.currentTerm = args.Term
 		n.votedFor = ""
 		n.clearCommitWaiters(ErrNotLeader)
@@ -34,6 +37,21 @@ func (n *Node) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 	}
 
 	// §5.3: merge entries into our log.
+	// Collect genuinely new/conflicting entries so we can WAL them as a batch
+	// before touching n.log.
+	var newEntries []LogEntry
+	for _, entry := range args.Entries {
+		if entry.Index <= n.lastIncludedIndex {
+			continue
+		}
+		existingTerm, ok := n.termAt(entry.Index)
+		if !ok || existingTerm != entry.Term {
+			newEntries = append(newEntries, entry)
+		}
+	}
+	if len(newEntries) > 0 && n.OnLogAppend != nil {
+		n.OnLogAppend(newEntries)
+	}
 	for _, entry := range args.Entries {
 		if entry.Index <= n.lastIncludedIndex {
 			continue // already compacted into snapshot

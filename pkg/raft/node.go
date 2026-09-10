@@ -70,6 +70,14 @@ type Node struct {
 
 	resetCh chan struct{}
 	stopCh  chan struct{}
+
+	// OnHardStateChange, if non-nil, is called (under n.mu) before currentTerm
+	// or votedFor are updated.  Use this to persist hard state to a WAL.
+	OnHardStateChange func(term int, votedFor string)
+
+	// OnLogAppend, if non-nil, is called (under n.mu) before entries are
+	// appended to n.log.  Use this to persist new entries to a WAL.
+	OnLogAppend func(entries []LogEntry)
 }
 
 // NewNode creates a new Raft node ready to be started.
@@ -367,6 +375,9 @@ func (n *Node) Submit(cmd []byte) error {
 		Term:    n.currentTerm,
 		Index:   idx,
 		Command: cmd,
+	}
+	if n.OnLogAppend != nil {
+		n.OnLogAppend([]LogEntry{entry})
 	}
 	n.log = append(n.log, entry)
 	log.Printf("[%s] Submit: appended entry at index %d (term %d)", n.id, idx, n.currentTerm)
