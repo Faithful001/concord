@@ -21,6 +21,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Faithful001/concord.git/internal/command"
@@ -33,6 +34,7 @@ import (
 type RaftNode interface {
 	IsLeader() bool
 	CurrentLeaderID() string
+	Peers() []string
 	Submit(cmd []byte) error
 }
 
@@ -41,6 +43,7 @@ type Server struct {
 	nodeID   string
 	node     RaftNode
 	store    *storage.Store
+	mu       sync.RWMutex
 	apiPeers map[string]string // peer-id → "host:port" (no scheme)
 	client   *http.Client
 }
@@ -48,13 +51,31 @@ type Server struct {
 // New creates a new API Server.
 // apiPeers maps peer node IDs to their API "host:port" address (without http://).
 func New(nodeID string, node RaftNode, store *storage.Store, apiPeers map[string]string) *Server {
+	peersCopy := make(map[string]string, len(apiPeers))
+	for k, v := range apiPeers {
+		peersCopy[k] = v
+	}
 	return &Server{
 		nodeID:   nodeID,
 		node:     node,
 		store:    store,
-		apiPeers: apiPeers,
+		apiPeers: peersCopy,
 		client:   &http.Client{Timeout: 6 * time.Second},
 	}
+}
+
+// AddAPIPeer registers a peer's API address.
+func (s *Server) AddAPIPeer(id, apiAddr string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.apiPeers[id] = apiAddr
+}
+
+// RemoveAPIPeer unregisters a peer's API address.
+func (s *Server) RemoveAPIPeer(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.apiPeers, id)
 }
 
 // Serve starts the HTTP server on addr. Blocks until it exits.
@@ -72,10 +93,13 @@ func (s *Server) Serve(addr string) error {
 func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/kv/", s.handleKV)
+	mux.HandleFunc("/v1/members", s.handleMembers)
+	mux.HandleFunc("/v1/members/", s.handleMemberDelete)
 	mux.HandleFunc("/v1/status", s.handleStatus)
 	mux.HandleFunc("/healthz", s.handleHealth)
 	return mux
 }
+
 
 // ── Route dispatch ────────────────────────────────────────────────────────────
 
@@ -165,6 +189,130 @@ func (s *Server) doDelete(w http.ResponseWriter, r *http.Request, key string) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// ── Cluster membership handlers ───────────────────────────────────────────────
+
+func (s *Server) handleMembers(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.doGetMembers(w, r)
+	case http.MethodPost:
+		s.doAddMember(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleMemberDelete(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/v1/members/")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "member id is required"})
+		return
+	}
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.doRemoveMember(w, r, id)
+}
+
+type MemberInfo struct {
+	ID       string `json:"id"`
+	APIAddr  string `json:"api_addr,omitempty"`
+	IsLeader bool   `json:"is_leader"`
+	IsSelf   bool   `json:"is_self"`
+}
+
+func (s *Server) doGetMembers(w http.ResponseWriter, _ *http.Request) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	leaderID := s.node.CurrentLeaderID()
+	peers := s.node.Peers()
+
+	members := make([]MemberInfo, 0, len(peers)+1)
+	members = append(members, MemberInfo{
+		ID:       s.nodeID,
+		IsLeader: s.node.IsLeader(),
+		IsSelf:   true,
+	})
+
+	for _, p := range peers {
+		members = append(members, MemberInfo{
+			ID:       p,
+			APIAddr:  s.apiPeers[p],
+			IsLeader: p == leaderID,
+			IsSelf:   false,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"leader_id": leaderID,
+		"members":   members,
+	})
+}
+
+func (s *Server) doAddMember(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to read body"})
+		return
+	}
+
+	if !s.node.IsLeader() {
+		s.forwardToLeader(w, r, body)
+		return
+	}
+
+	var req struct {
+		ID       string `json:"id"`
+		RaftAddr string `json:"raft_addr"`
+		APIAddr  string `json:"api_addr"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil || req.ID == "" || req.RaftAddr == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id and raft_addr are required"})
+		return
+	}
+
+	cmd := command.EncodeAddPeer(req.ID, req.RaftAddr, req.APIAddr)
+	if err := s.node.Submit(cmd); err != nil {
+		if errors.Is(err, raft.ErrNotLeader) {
+			s.forwardToLeader(w, r, body)
+			return
+		}
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status":    "added",
+		"id":        req.ID,
+		"raft_addr": req.RaftAddr,
+		"api_addr":  req.APIAddr,
+	})
+}
+
+func (s *Server) doRemoveMember(w http.ResponseWriter, r *http.Request, id string) {
+	if !s.node.IsLeader() {
+		s.forwardToLeader(w, r, nil)
+		return
+	}
+
+	cmd := command.EncodeRemovePeer(id)
+	if err := s.node.Submit(cmd); err != nil {
+		if errors.Is(err, raft.ErrNotLeader) {
+			s.forwardToLeader(w, r, nil)
+			return
+		}
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status": "removed",
+		"id":     id,
+	})
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {

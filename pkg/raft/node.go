@@ -121,6 +121,50 @@ func (n *Node) CurrentLeaderID() string {
 	return n.leaderID
 }
 
+// Peers returns a copy of the active peer IDs.
+func (n *Node) Peers() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	peersCopy := make([]string, len(n.peers))
+	copy(peersCopy, n.peers)
+	return peersCopy
+}
+
+// AddPeer adds a peer ID to the cluster membership dynamically.
+func (n *Node) AddPeer(id string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	for _, p := range n.peers {
+		if p == id {
+			return // already present
+		}
+	}
+	n.peers = append(n.peers, id)
+	lastIdx, _ := n.lastLogIndexAndTerm()
+	n.nextIndex[id] = lastIdx + 1
+	n.matchIndex[id] = 0
+	log.Printf("[%s] added peer %s (total peers: %d)", n.id, id, len(n.peers))
+}
+
+// RemovePeer removes a peer ID from the cluster membership dynamically.
+func (n *Node) RemovePeer(id string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	filtered := make([]string, 0, len(n.peers))
+	for _, p := range n.peers {
+		if p != id {
+			filtered = append(filtered, p)
+		}
+	}
+	n.peers = filtered
+	delete(n.nextIndex, id)
+	delete(n.matchIndex, id)
+	log.Printf("[%s] removed peer %s (total peers: %d)", n.id, id, len(n.peers))
+}
+
+
 // Submit appends cmd to the Raft log and blocks until the entry commits (i.e.
 // a majority of nodes have written it) or a timeout occurs.
 //

@@ -7,12 +7,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Faithful001/concord.git/pkg/raft"
 	"github.com/Faithful001/concord.git/internal/api"
+	"github.com/Faithful001/concord.git/internal/command"
 	"github.com/Faithful001/concord.git/internal/fsm"
 	"github.com/Faithful001/concord.git/internal/persist"
 	"github.com/Faithful001/concord.git/internal/storage"
 	"github.com/Faithful001/concord.git/internal/transport"
+	"github.com/Faithful001/concord.git/pkg/raft"
 )
 
 func main() {
@@ -67,6 +68,29 @@ func main() {
 	node := raft.NewNode(*id, peerIDs, rpcTransport)
 	stateMachine := fsm.New(store)
 
+	var apiServer *api.Server
+	if *apiAddr != "" {
+		apiServer = api.New(*id, node, store, apiAddrs)
+	}
+
+	stateMachine.SetMembershipHandler(func(op byte, peerID, raftAddr, apiAddr string) {
+		if op == command.OpAddPeer {
+			node.AddPeer(peerID)
+			if raftAddr != "" {
+				rpcTransport.AddPeer(peerID, raftAddr)
+			}
+			if apiServer != nil && apiAddr != "" {
+				apiServer.AddAPIPeer(peerID, apiAddr)
+			}
+		} else if op == command.OpRemovePeer {
+			node.RemovePeer(peerID)
+			rpcTransport.RemovePeer(peerID)
+			if apiServer != nil {
+				apiServer.RemoveAPIPeer(peerID)
+			}
+		}
+	})
+
 	// ── Restore snapshot ──────────────────────────────────────────────────────
 	if snap != nil {
 		node.RestoreSnapshot(snap.ToSnapshotState())
@@ -117,8 +141,7 @@ func main() {
 	}()
 
 	// ── HTTP API server (optional) ────────────────────────────────────────────
-	if *apiAddr != "" {
-		apiServer := api.New(*id, node, store, apiAddrs)
+	if apiServer != nil {
 		go func() {
 			if serveErr := apiServer.Serve(*apiAddr); serveErr != nil {
 				log.Fatalf("[%s] API serve failed: %v", *id, serveErr)

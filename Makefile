@@ -3,13 +3,17 @@ CLI_BINARY := cordctl
 BIN_DIR := bin
 DATA_DIR := data
 
-.PHONY: all build build-server build-ctl test fmt vet clean \
+.PHONY: all build build-server build-ctl proto test fmt vet clean \
         run-node1 run-node2 run-node3 \
         docker-build docker-up docker-down docker-logs
 
 # ─── Local development ────────────────────────────────────────────────────────
 
 all: build
+
+## proto: generate protobuf Go code
+proto:
+	protoc --go_out=. --go_opt=module=github.com/Faithful001/concord.git --go-grpc_out=. --go-grpc_opt=module=github.com/Faithful001/concord.git proto/raft.proto
 
 ## build: compile concord server and cordctl CLI
 build: build-server build-ctl

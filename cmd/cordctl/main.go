@@ -28,11 +28,14 @@ func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: cordctl [options] <command> [args...]\n\n")
 		fmt.Fprintf(os.Stderr, "Commands:\n")
-		fmt.Fprintf(os.Stderr, "  put <key> <value>    Write a key-value pair\n")
-		fmt.Fprintf(os.Stderr, "  get <key>            Read the value for a key\n")
-		fmt.Fprintf(os.Stderr, "  del <key>            Delete a key\n")
-		fmt.Fprintf(os.Stderr, "  status               Check cluster status and leader info\n")
-		fmt.Fprintf(os.Stderr, "  health               Check node health\n\n")
+		fmt.Fprintf(os.Stderr, "  put <key> <value>                  Write a key-value pair\n")
+		fmt.Fprintf(os.Stderr, "  get <key>                          Read the value for a key\n")
+		fmt.Fprintf(os.Stderr, "  del <key>                          Delete a key\n")
+		fmt.Fprintf(os.Stderr, "  status                             Check cluster status and leader info\n")
+		fmt.Fprintf(os.Stderr, "  health                             Check node health\n")
+		fmt.Fprintf(os.Stderr, "  member list                        List all cluster members\n")
+		fmt.Fprintf(os.Stderr, "  member add <id> <raft> [api]       Add a new node to the cluster\n")
+		fmt.Fprintf(os.Stderr, "  member remove <id>                 Remove a node from the cluster\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 	}
@@ -87,11 +90,43 @@ func main() {
 	case "health", "healthz":
 		getHealth(client, endpoint)
 
+	case "member", "members":
+		if len(args) < 2 {
+			fmt.Fprintf(os.Stderr, "Error: 'member' subcommand required (list, add, remove)\n")
+			os.Exit(1)
+		}
+		switch args[1] {
+		case "list", "ls":
+			listMembers(client, endpoint)
+		case "add":
+			if len(args) < 4 {
+				fmt.Fprintf(os.Stderr, "Error: 'member add' requires <id> and <raft_addr>\nUsage: cordctl member add <id> <raft_addr> [api_addr]\n")
+				os.Exit(1)
+			}
+			id, raftAddr := args[2], args[3]
+			apiAddr := ""
+			if len(args) >= 5 {
+				apiAddr = args[4]
+			}
+			addMember(client, endpoint, id, raftAddr, apiAddr)
+		case "remove", "rm", "del", "delete":
+			if len(args) < 3 {
+				fmt.Fprintf(os.Stderr, "Error: 'member remove' requires <id>\nUsage: cordctl member remove <id>\n")
+				os.Exit(1)
+			}
+			id := args[2]
+			removeMember(client, endpoint, id)
+		default:
+			fmt.Fprintf(os.Stderr, "Unknown member subcommand: %s\n", args[1])
+			os.Exit(1)
+		}
+
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", args[0])
 		flag.Usage()
 		os.Exit(1)
 	}
+
 }
 
 func putKey(client *http.Client, endpoint, key, val string) {
@@ -217,3 +252,80 @@ func getHealth(client *http.Client, endpoint string) {
 		os.Exit(1)
 	}
 }
+
+func listMembers(client *http.Client, endpoint string) {
+	url := fmt.Sprintf("%s/v1/members", endpoint)
+	resp, err := client.Get(url)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Request error: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to read response: %v\n", err)
+		os.Exit(1)
+	}
+
+	var pretty bytes.Buffer
+	if err := json.Indent(&pretty, body, "", "  "); err == nil {
+		fmt.Println(pretty.String())
+	} else {
+		fmt.Println(string(body))
+	}
+}
+
+func addMember(client *http.Client, endpoint, id, raftAddr, apiAddr string) {
+	url := fmt.Sprintf("%s/v1/members", endpoint)
+	payload := map[string]string{
+		"id":        id,
+		"raft_addr": raftAddr,
+		"api_addr":  apiAddr,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to encode request: %v\n", err)
+		os.Exit(1)
+	}
+
+	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Request error: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		fmt.Printf("Member %s added successfully.\n", id)
+	} else {
+		fmt.Fprintf(os.Stderr, "Error (%d): %s\n", resp.StatusCode, string(respBody))
+		os.Exit(1)
+	}
+}
+
+func removeMember(client *http.Client, endpoint, id string) {
+	url := fmt.Sprintf("%s/v1/members/%s", endpoint, id)
+	req, err := http.NewRequest(http.MethodDelete, url, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create request: %v\n", err)
+		os.Exit(1)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Request error: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		fmt.Printf("Member %s removed successfully.\n", id)
+	} else {
+		fmt.Fprintf(os.Stderr, "Error (%d): %s\n", resp.StatusCode, string(respBody))
+		os.Exit(1)
+	}
+}
+

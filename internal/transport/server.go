@@ -2,30 +2,25 @@ package transport
 
 import (
 	"net"
-	"net/rpc"
 
+	"google.golang.org/grpc"
+
+	"github.com/Faithful001/concord.git/internal/rpc"
 	"github.com/Faithful001/concord.git/pkg/raft"
-	rpcSvc "github.com/Faithful001/concord.git/internal/rpc"
+	"github.com/Faithful001/concord.git/pkg/raftpb"
 )
 
-// Serve registers the node's RPC methods and starts accepting connections on
-// addr.  It blocks until the listener is closed.
-//
-// A fresh rpc.Server is used (rather than the package-level default) so that
-// multiple nodes can be started in the same process without "already
-// registered" panics — useful for integration tests.
+// Serve registers the node's Raft gRPC service and starts accepting connections on
+// addr. It blocks until the listener is closed.
 func Serve(node *raft.Node, addr string) error {
-	srv := rpc.NewServer()
-	service := rpcSvc.NewRPCService(node)
-	if err := srv.Register(service); err != nil {
-		return err
-	}
-
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
 
-	srv.Accept(listener) // blocks until listener is closed
-	return nil
+	grpcServer := grpc.NewServer()
+	service := rpc.NewRPCService(node)
+	raftpb.RegisterRaftServiceServer(grpcServer, service)
+
+	return grpcServer.Serve(listener)
 }

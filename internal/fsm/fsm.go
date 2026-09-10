@@ -12,14 +12,23 @@ import (
 	"github.com/Faithful001/concord.git/internal/storage"
 )
 
+// MembershipChangeHandler is called when a cluster membership change is applied.
+type MembershipChangeHandler func(op byte, id, raftAddr, apiAddr string)
+
 // FSM applies committed Raft log entries to the key-value store.
 type FSM struct {
-	store *storage.Store
+	store             *storage.Store
+	membershipHandler MembershipChangeHandler
 }
 
 // New returns a new FSM backed by store.
 func New(store *storage.Store) *FSM {
 	return &FSM{store: store}
+}
+
+// SetMembershipHandler sets the callback for dynamic cluster membership changes.
+func (f *FSM) SetMembershipHandler(h MembershipChangeHandler) {
+	f.membershipHandler = h
 }
 
 // Store returns the underlying KV store (for read access by the API layer).
@@ -37,7 +46,6 @@ func (f *FSM) Restore(data map[string][]byte) {
 	f.store.Restore(data)
 }
 
-
 // Run reads ApplyMsgs from applyCh and applies each one.
 // It returns when applyCh is closed or drained on shutdown.
 func (f *FSM) Run(applyCh <-chan raft.ApplyMsg) {
@@ -51,6 +59,19 @@ func (f *FSM) Run(applyCh <-chan raft.ApplyMsg) {
 func (f *FSM) ApplyEntry(msg raft.ApplyMsg) {
 	if len(msg.Command) == 0 {
 		return // no-op / heartbeat entry — nothing to apply
+	}
+
+	// Check if this is a membership change command
+	if msg.Command[0] == command.OpAddPeer || msg.Command[0] == command.OpRemovePeer {
+		op, id, raftAddr, apiAddr, err := command.DecodePeer(msg.Command)
+		if err != nil {
+			log.Printf("[fsm] membership decode error at index %d: %v", msg.Index, err)
+			return
+		}
+		if f.membershipHandler != nil {
+			f.membershipHandler(op, id, raftAddr, apiAddr)
+		}
+		return
 	}
 
 	op, key, value, err := command.Decode(msg.Command)
@@ -71,3 +92,4 @@ func (f *FSM) ApplyEntry(msg raft.ApplyMsg) {
 		}
 	}
 }
+

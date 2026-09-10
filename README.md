@@ -97,6 +97,11 @@ go build -o bin/cordctl ./cmd/cordctl
 
 # Delete a key
 ./bin/cordctl del hello
+
+# Manage cluster membership
+./bin/cordctl member list
+./bin/cordctl member add node-4 localhost:8004 localhost:9004
+./bin/cordctl member remove node-4
 ```
 
 #### Using `curl`
@@ -164,13 +169,12 @@ go install github.com/Faithful001/concord.git/cmd/concord@latest
         │                    │                    │
         ▼                    ▼                    ▼
 ┌────────────────┐   ┌────────────────┐   ┌───────────────────┐
-│  internal/raft │   │ internal/rpc   │   │ internal/transport│
+│    pkg/raft    │   │  internal/rpc  │   │ internal/transport│
 │                │   │                │   │                   │
-│ Pure consensus │   │ Adapts Node's  │   │ Client-side       │
-│ logic. Knows   │   │ methods to the │   │ (dial + call) and │
-│ nothing about  │   │ net/rpc calling│   │ server-side       │
-│ networking.    │   │ convention.    │   │ (listen + accept) │
-│                │   │                │   │ real TCP/RPC.     │
+│ Pure consensus │   │ Adapts Node to │   │ Client-side       │
+│ engine. Knows  │   │ gRPC service   │   │ (dial + call) and │
+│ nothing about  │   │ definition in  │   │ server-side       │
+│ networking.    │   │ pkg/raftpb.    │   │ gRPC over HTTP/2. │
 └───────┬────────┘   └────────┬───────┘   └─────────┬─────────┘
         │                     │                     │
         │                     └──────────┬──────────┘
@@ -219,18 +223,22 @@ The exported, reusable Raft consensus engine with zero networking dependencies. 
 - **`log.go`**: the `LogEntry` type: `Term`, `Index`, and an opaque `Command []byte` (Raft never interprets the command itself, as that's the FSM's job).
 - **`transport.go`**: the `Transport` interface that `raft` depends on but never implements.
 - **`apply.go`**: `ApplyMsg` (the message type sent to the FSM) and `SnapshotState` (serialisable persistent state).
-- **`messages.go`**: `RequestVoteArgs`/`Reply` and `AppendEntriesArgs`/`Reply` RPC message types.
+- **`messages.go`**: `RequestVoteArgs`/`Reply` and `AppendEntriesArgs`/`Reply` message types.
+
+### `pkg/raftpb/`
+
+Generated Protocol Buffer (`proto/raft.proto`) and gRPC Go bindings (`raft.pb.go`, `raft_grpc.pb.go`) for type-safe, cross-language Raft RPC serialization.
 
 ### `internal/rpc/`
 
-The adapter between `raft.Node` and Go's `net/rpc` calling convention (`func(args, *reply) error`). `RPCService` wraps a `Node` and exposes `RequestVote`/`AppendEntries` in the shape `net/rpc` requires.
+The adapter between `raft.Node` and the gRPC `RaftServiceServer` interface defined in `pkg/raftpb`.
 
 ### `internal/transport/`
 
-The real, network-based implementation of `raft.Transport`.
+The real, gRPC network-based implementation of `raft.Transport`.
 
-- **`rpc_transport.go`**: `RPCTransport`, the **client** side: dials a peer over TCP and makes an RPC call (`SendRequestVote`, `SendAppendEntries`).
-- **`server.go`**: `Serve`, the **server** side: opens a TCP listener, registers the `RPCService`, and accepts incoming RPC connections. Every node runs both sides: each node is simultaneously a client (reaching out to peers) and a server (accepting calls from peers).
+- **`rpc_transport.go`**: `RPCTransport`, the **client** side: manages pooled `grpc.ClientConn` connections to peers and executes remote calls (`SendRequestVote`, `SendAppendEntries`).
+- **`server.go`**: `Serve`, the **server** side: opens a TCP listener, registers `RaftServiceServer` on a `grpc.Server`, and accepts incoming gRPC requests. Every node runs both client and server.
 
 ### `internal/storage/`
 
@@ -302,14 +310,14 @@ Randomized timeouts (a fresh random value chosen every time the timer restarts) 
 
 ## The networking layer
 
-Concord uses Go's built-in `net/rpc` package over raw TCP: no protobuf or code generation required, keeping the stack simple while still being genuine inter-process networking.
+Concord uses **gRPC** and **Protocol Buffers (proto3)** over HTTP/2 TCP sockets:
 
-- **`net.Listen("tcp", addr)`** opens a real TCP socket: pure networking, no RPC-specific behavior yet.
-- **`rpc.NewServer()` + `srv.Register(service)`** tells `net/rpc` to expose `RPCService`'s methods, callable remotely by the string `"RPCService.MethodName"`.
-- **`srv.Accept(listener)`** sits on top of the listener, handling incoming connections: reading which method was requested, decoding arguments, calling the real Go method, and writing back the reply.
-- On the client side, **`rpc.Dial("tcp", addr)`** opens a connection to a peer, and **`client.Call("RPCService.RequestVote", args, &reply)`** performs the actual remote call: serializing `args`, sending them, and blocking until the reply arrives.
+- **`proto/raft.proto`** defines the canonical Raft service contract (`RequestVote`, `AppendEntries`) and message types (`LogEntryProto`, `RequestVoteRequest`, `AppendEntriesRequest`).
+- **`pkg/raftpb`** contains the generated Go protobuf structs and gRPC client/server interfaces.
+- On the server side, **`grpc.NewServer()`** registers `rpc.RPCService` and listens for incoming gRPC calls via **`transport.Serve(node, addr)`**.
+- On the client side, **`RPCTransport`** maintains pooled connections (`grpc.ClientConn`) to each peer and calls `RaftServiceClient.RequestVote` / `AppendEntries`.
 
-Every node in the cluster runs **both** a server (via `transport.Serve`, so peers can reach it) and a client (via `RPCTransport`, so it can reach peers). There's no single "the server" in a peer-to-peer system like this.
+Every node in the cluster runs **both** a server (via `transport.Serve`, so peers can reach it) and a client (via `RPCTransport`, so it can reach peers).
 
 ---
 
@@ -378,6 +386,45 @@ curl http://localhost:9001/v1/status
 Liveness probe.
 
 **Response: 200 OK** with body `ok`
+
+### `GET /v1/members`
+
+List all cluster members.
+
+```bash
+curl http://localhost:9001/v1/members
+```
+
+**Response (200 OK):**
+```json
+[
+  {"id":"node-1","raft_addr":"localhost:8001","api_addr":"localhost:9001"},
+  {"id":"node-2","raft_addr":"localhost:8002","api_addr":"localhost:9002"},
+  {"id":"node-3","raft_addr":"localhost:8003","api_addr":"localhost:9003"}
+]
+```
+
+### `POST /v1/members`
+
+Add a new node to the cluster at runtime (replicated via consensus).
+
+```bash
+curl -X POST http://localhost:9001/v1/members \
+     -H "Content-Type: application/json" \
+     -d '{"id":"node-4","raft_addr":"localhost:8004","api_addr":"localhost:9004"}'
+```
+
+**Response: 200 OK**
+
+### `DELETE /v1/members/{id}`
+
+Remove a node from the cluster at runtime.
+
+```bash
+curl -X DELETE http://localhost:9001/v1/members/node-4
+```
+
+**Response: 200 OK**
 
 ### Leader forwarding
 
@@ -461,10 +508,9 @@ sudo systemctl enable --now concord
 
 A few choices worth explaining, since they weren't the only options:
 
-- **`Role` is a `string` type, not an `int` with `iota`.** Slightly more memory per value, but self-describing when logged or printed (`"Leader"` instead of `2`), which is worth it for a project where debugging election behavior via logs is a core activity.
-- **`Transport` is an interface, satisfied by both `RPCTransport` (real) and, historically, `MockTransport` (an in-process fake used during early development).** This let election and replication logic be built and tested before any real networking existed, and would let a future gRPC-based transport be swapped in without touching `raft` at all.
-- **`net/rpc` over gRPC, for now.** No code generation or protobuf tooling required, keeping the networking footprint lightweight. gRPC remains a straightforward upgrade path if cross-language interoperability is required.
-- **`internal/` for almost everything currently.** Go's `internal/` convention prevents external packages from importing these, which is appropriate while the API surface is still unstable. Packages intended for the "importable library" roadmap goal will need to move out of `internal/` once their public API is deliberately designed, not accidentally exposed.
+- **`Transport` is an interface, satisfied by `RPCTransport` (gRPC) and in-memory mock transports for testing.** This lets election and replication logic remain completely independent of networking details.
+- **gRPC and Protocol Buffers for inter-node communication.** Provides strongly-typed RPC schemas (`proto/raft.proto`), high performance over HTTP/2, connection pooling, and cross-language interoperability.
+- **`internal/` for private server internals, `pkg/` for public libraries.** Go's `internal/` convention encapsulates Concord-specific server components, while `pkg/raft` and `pkg/raftpb` provide clean public packages that can be imported by third-party Go projects.
 - **JSON snapshots over WAL.** Simple, correct, easy to debug (you can read the snapshot file). The tradeoff is that the full log is serialised every snapshot cycle, but for the scale Concord targets this is fast enough. A proper WAL is a straightforward upgrade path.
 - **Leader forwarding via HTTP reverse-proxy.** Simpler than client-side leader discovery + retry logic. Any node in the cluster can accept any request.
 
@@ -477,8 +523,8 @@ A few choices worth explaining, since they weren't the only options:
 - [x] Export standalone Raft consensus engine (`pkg/raft`) for embedding in custom applications
 - [x] Standalone CLI client tool (`cmd/cordctl`) for managing clusters
 - [x] Snapshotting and log compaction (so the log doesn't grow forever)
-- [ ] Cluster membership changes (adding/removing nodes while running)
-- [ ] Switching `net/rpc` for gRPC (cross-language compatibility, better tooling)
+- [x] Cluster membership changes (adding/removing nodes while running)
+- [x] Switching `net/rpc` for gRPC (cross-language compatibility, better tooling)
 - [ ] Read-only replica support / linearizable read optimizations
 - [ ] Full write-ahead log (WAL) for crash recovery without full-log snapshots
 
