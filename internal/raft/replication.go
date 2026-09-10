@@ -33,13 +33,17 @@ func (n *Node) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 		}
 	}
 
-	// §5.3: merge entries into our log.
+// §5.3: merge entries into our log.
 	for _, entry := range args.Entries {
+		if entry.Index <= n.lastIncludedIndex {
+			continue // already compacted into snapshot
+		}
 		existingTerm, ok := n.termAt(entry.Index)
 		switch {
 		case ok && existingTerm != entry.Term:
 			// Conflict: truncate from this point and take the leader's version.
-			n.log = n.log[:entry.Index-1]
+			offset := entry.Index - n.lastIncludedIndex - 1
+			n.log = n.log[:offset]
 			n.log = append(n.log, entry)
 		case !ok:
 			// New entry past the end of our log — append it.
@@ -67,10 +71,20 @@ func (n *Node) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 }
 
 // termAt returns the term of the log entry at the given 1-based index, and
-// whether such an entry exists.
+// whether such an entry exists (including compacted snapshot boundary).
 func (n *Node) termAt(index int) (int, bool) {
-	if index < 1 || index > len(n.log) {
+	if index < 1 {
 		return 0, false
 	}
-	return n.log[index-1].Term, true
+	if index == n.lastIncludedIndex {
+		return n.lastIncludedTerm, true
+	}
+	if index < n.lastIncludedIndex {
+		return 0, false // compacted
+	}
+	offset := index - n.lastIncludedIndex - 1
+	if offset < 0 || offset >= len(n.log) {
+		return 0, false
+	}
+	return n.log[offset].Term, true
 }

@@ -7,11 +7,15 @@ type ApplyMsg struct {
 	Command []byte
 }
 
-// SnapshotState captures the persistent Raft state for snapshotting.
+// SnapshotState captures the persistent Raft and state machine state for snapshotting.
 // It is safe to serialise with encoding/json.
 type SnapshotState struct {
-	CurrentTerm int
-	VotedFor    string
-	Log         []LogEntry
-	CommitIndex int
+	CurrentTerm       int
+	VotedFor          string
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Log               []LogEntry
+	CommitIndex       int
+	Data              map[string][]byte
 }
+

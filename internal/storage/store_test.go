@@ -104,3 +104,28 @@ func TestConcurrentAccess(t *testing.T) {
 	
 	wg.Wait()
 }
+
+func TestSnapshotAndRestore(t *testing.T) {
+	s1 := NewStore()
+	s1.Set("k1", []byte("v1"))
+	s1.Set("k2", []byte("v2"))
+
+	snap := s1.Snapshot()
+
+	// Verify deep copy by mutating original store
+	s1.Set("k1", []byte("v1_mutated"))
+	s1.Delete("k2")
+
+	s2 := NewStore()
+	s2.Restore(snap)
+
+	v1, err := s2.Get("k1")
+	if err != nil || !bytes.Equal(v1, []byte("v1")) {
+		t.Errorf("Restore k1 = %q, want %q (err: %v)", v1, "v1", err)
+	}
+
+	v2, err := s2.Get("k2")
+	if err != nil || !bytes.Equal(v2, []byte("v2")) {
+		t.Errorf("Restore k2 = %q, want %q (err: %v)", v2, "v2", err)
+	}
+}

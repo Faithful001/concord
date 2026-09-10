@@ -169,19 +169,26 @@ func (n *Node) replicateToPeer(peer string, leaderTerm int) {
 	nextIdx := n.nextIndex[peer]
 	lastIdx, _ := n.lastLogIndexAndTerm()
 
+	// If peer is behind compacted log, clamp nextIndex to current log start
+	if nextIdx <= n.lastIncludedIndex {
+		nextIdx = n.lastIncludedIndex + 1
+		n.nextIndex[peer] = nextIdx
+	}
+
 	// Collect the entries this peer is missing (empty slice = heartbeat).
 	var entries []LogEntry
 	if nextIdx <= lastIdx {
-		src := n.log[nextIdx-1 : lastIdx]
-		entries = make([]LogEntry, len(src))
-		copy(entries, src)
+		startOffset := nextIdx - n.lastIncludedIndex - 1
+		endOffset := lastIdx - n.lastIncludedIndex
+		if startOffset >= 0 && endOffset <= len(n.log) && startOffset <= endOffset {
+			src := n.log[startOffset:endOffset]
+			entries = make([]LogEntry, len(src))
+			copy(entries, src)
+		}
 	}
 
 	prevLogIndex := nextIdx - 1
-	prevLogTerm := 0
-	if prevLogIndex > 0 && prevLogIndex <= len(n.log) {
-		prevLogTerm = n.log[prevLogIndex-1].Term
-	}
+	prevLogTerm, _ := n.termAt(prevLogIndex)
 
 	commitIndex := n.commitIndex
 	leaderID := n.id
@@ -225,19 +232,20 @@ func (n *Node) replicateToPeer(peer string, leaderTerm int) {
 		n.maybeAdvanceCommitIndex(leaderTerm)
 	} else {
 		// Consistency check failed — back up and retry next tick.
-		if n.nextIndex[peer] > 1 {
+		if n.nextIndex[peer] > n.lastIncludedIndex+1 {
 			n.nextIndex[peer]--
 		}
 	}
 }
 
 // maybeAdvanceCommitIndex finds the highest N > commitIndex such that
-// log[N-1].Term == leaderTerm and a majority of nodes have matchIndex >= N,
+// termAt(N) == leaderTerm and a majority of nodes have matchIndex >= N,
 // then commits up to N.  Must be called with n.mu held.
 func (n *Node) maybeAdvanceCommitIndex(leaderTerm int) {
 	lastIdx, _ := n.lastLogIndexAndTerm()
 	for N := lastIdx; N > n.commitIndex; N-- {
-		if N > len(n.log) || n.log[N-1].Term != leaderTerm {
+		term, ok := n.termAt(N)
+		if !ok || term != leaderTerm {
 			continue
 		}
 		count := 1 // leader itself

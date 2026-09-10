@@ -34,6 +34,10 @@ type Node struct {
 	votedFor    string
 	log         []LogEntry
 
+	// Compacted snapshot metadata (§7 of the paper).
+	lastIncludedIndex int
+	lastIncludedTerm  int
+
 	// Volatile state — all nodes.
 	commitIndex int
 	lastApplied int
@@ -65,21 +69,23 @@ type Node struct {
 // NewNode creates a new Raft node ready to be started.
 func NewNode(id string, peers []string, transport Transport) *Node {
 	return &Node{
-		id:            id,
-		role:          Follower,
-		currentTerm:   0,
-		votedFor:      "",
-		log:           []LogEntry{},
-		commitIndex:   0,
-		lastApplied:   0,
-		nextIndex:     make(map[string]int),
-		matchIndex:    make(map[string]int),
-		peers:         peers,
-		transport:     transport,
-		applyCh:       make(chan ApplyMsg, 512),
-		commitWaiters: make(map[int][]chan error),
-		resetCh:       make(chan struct{}, 1),
-		stopCh:        make(chan struct{}),
+		id:                id,
+		role:              Follower,
+		currentTerm:       0,
+		votedFor:          "",
+		log:               []LogEntry{},
+		lastIncludedIndex: 0,
+		lastIncludedTerm:  0,
+		commitIndex:       0,
+		lastApplied:       0,
+		nextIndex:         make(map[string]int),
+		matchIndex:        make(map[string]int),
+		peers:             peers,
+		transport:         transport,
+		applyCh:           make(chan ApplyMsg, 512),
+		commitWaiters:     make(map[int][]chan error),
+		resetCh:           make(chan struct{}, 1),
+		stopCh:            make(chan struct{}),
 	}
 }
 
@@ -152,36 +158,55 @@ func (n *Node) Submit(cmd []byte) error {
 
 // ── Snapshot support ──────────────────────────────────────────────────────────
 
-// TakeSnapshot captures the current persistent state for serialisation.
-func (n *Node) TakeSnapshot() SnapshotState {
+// TakeSnapshot captures the state machine snapshot data and compacts the in-memory log
+// up to commitIndex.
+func (n *Node) TakeSnapshot(data map[string][]byte) SnapshotState {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+
+	// If commitIndex > lastIncludedIndex, compact the in-memory log
+	if n.commitIndex > n.lastIncludedIndex {
+		compactTerm, _ := n.termAt(n.commitIndex)
+		cut := n.commitIndex - n.lastIncludedIndex
+		if cut > 0 && cut <= len(n.log) {
+			n.log = append([]LogEntry(nil), n.log[cut:]...)
+		}
+		n.lastIncludedIndex = n.commitIndex
+		n.lastIncludedTerm = compactTerm
+	}
+
 	logCopy := make([]LogEntry, len(n.log))
 	copy(logCopy, n.log)
+
 	return SnapshotState{
-		CurrentTerm: n.currentTerm,
-		VotedFor:    n.votedFor,
-		Log:         logCopy,
-		CommitIndex: n.commitIndex,
+		CurrentTerm:       n.currentTerm,
+		VotedFor:          n.votedFor,
+		LastIncludedIndex: n.lastIncludedIndex,
+		LastIncludedTerm:  n.lastIncludedTerm,
+		Log:               logCopy,
+		CommitIndex:       n.commitIndex,
+		Data:              data,
 	}
 }
 
 // RestoreSnapshot loads previously persisted state back into the node.
-// It must be called before Start.  After calling this, call ReplayCommitted
-// to apply all committed entries to the FSM.
+// It must be called before Start.
 func (n *Node) RestoreSnapshot(snap SnapshotState) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.currentTerm = snap.CurrentTerm
 	n.votedFor = snap.VotedFor
+	n.lastIncludedIndex = snap.LastIncludedIndex
+	n.lastIncludedTerm = snap.LastIncludedTerm
 	n.log = snap.Log
 	n.commitIndex = snap.CommitIndex
 	// lastApplied = commitIndex so sendToApplyCh will not re-send already-replayed
-	// entries once the node is live.  Main must replay them via ApplyEntry directly.
+	// entries once the node is live.
 	n.lastApplied = snap.CommitIndex
-	log.Printf("[%s] RestoreSnapshot: term=%d log=%d entries commitIndex=%d",
-		n.id, n.currentTerm, len(n.log), n.commitIndex)
+	log.Printf("[%s] RestoreSnapshot: term=%d lastIncludedIndex=%d log=%d entries commitIndex=%d",
+		n.id, n.currentTerm, n.lastIncludedIndex, len(n.log), n.commitIndex)
 }
+
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -238,17 +263,23 @@ func (n *Node) sendToApplyCh(from, to int) {
 	}
 	entries := make([]LogEntry, 0, to-from)
 	for i := from + 1; i <= to; i++ {
-		if i > len(n.log) {
+		if i <= n.lastIncludedIndex {
+			continue
+		}
+		offset := i - n.lastIncludedIndex - 1
+		if offset >= len(n.log) {
 			break
 		}
-		entries = append(entries, n.log[i-1])
+		entries = append(entries, n.log[offset])
 	}
 	n.lastApplied = to
-	go func() {
-		for _, e := range entries {
-			n.applyCh <- ApplyMsg{Index: e.Index, Command: e.Command}
-		}
-	}()
+	if len(entries) > 0 {
+		go func() {
+			for _, e := range entries {
+				n.applyCh <- ApplyMsg{Index: e.Index, Command: e.Command}
+			}
+		}()
+	}
 }
 
 // notifyCommitWaiters signals Submit callers waiting for indices in (from, to].
@@ -274,11 +305,11 @@ func (n *Node) clearCommitWaiters(err error) {
 }
 
 // lastLogIndexAndTerm returns the index and term of the last log entry,
-// or (0, 0) when the log is empty.
+// or (lastIncludedIndex, lastIncludedTerm) when the in-memory log is empty.
 // Must be called with n.mu held.
 func (n *Node) lastLogIndexAndTerm() (int, int) {
 	if len(n.log) == 0 {
-		return 0, 0
+		return n.lastIncludedIndex, n.lastIncludedTerm
 	}
 	last := n.log[len(n.log)-1]
 	return last.Index, last.Term

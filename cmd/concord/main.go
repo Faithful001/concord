@@ -71,19 +71,21 @@ func main() {
 	if snap != nil {
 		node.RestoreSnapshot(snap.ToSnapshotState())
 
-		// Replay all committed entries directly into the FSM so the in-memory
-		// store reflects the pre-crash state.  We do this before starting the
-		// FSM goroutine to avoid a data race between direct calls and the channel.
-		snapState := node.TakeSnapshot()
-		for _, entry := range snapState.Log {
-			if entry.Index <= snapState.CommitIndex {
+		// Restore in-memory key-value data directly from the snapshot
+		if snap.Data != nil {
+			stateMachine.Restore(snap.Data)
+		}
+
+		// Replay any remaining committed entries in the log past LastIncludedIndex
+		for _, entry := range snap.Log {
+			if entry.Index > snap.LastIncludedIndex && entry.Index <= snap.CommitIndex {
 				stateMachine.ApplyEntry(raft.ApplyMsg{
 					Index:   entry.Index,
 					Command: entry.Command,
 				})
 			}
 		}
-		log.Printf("[%s] snapshot restored: replayed %d committed entries", *id, snapState.CommitIndex)
+		log.Printf("[%s] snapshot restored: lastIncludedIndex=%d commitIndex=%d", *id, snap.LastIncludedIndex, snap.CommitIndex)
 	}
 
 	// ── Start FSM goroutine ───────────────────────────────────────────────────
@@ -95,12 +97,13 @@ func main() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			state := node.TakeSnapshot()
+			kvData := stateMachine.Snapshot()
+			state := node.TakeSnapshot(kvData)
 			if saveErr := persist.Save(*dataDir, *id, persist.FromSnapshotState(state)); saveErr != nil {
 				log.Printf("[%s] snapshot save error: %v", *id, saveErr)
 			} else {
-				log.Printf("[%s] snapshot saved (term=%d entries=%d commitIndex=%d)",
-					*id, state.CurrentTerm, len(state.Log), state.CommitIndex)
+				log.Printf("[%s] snapshot saved (term=%d lastIncludedIndex=%d remainingLog=%d commitIndex=%d)",
+					*id, state.CurrentTerm, state.LastIncludedIndex, len(state.Log), state.CommitIndex)
 			}
 		}
 	}()

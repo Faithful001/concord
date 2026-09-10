@@ -48,11 +48,29 @@ Concord implements all three from the ground up, providing a clean, production-g
 - ✅ **Docker & Compose**: one command spins up a 3-node cluster anywhere
 - ✅ **Provisionable**: works on localhost, VPS, or any machine with Docker or Go installed
 
+## Installation
+
+### Option 1: One-Line Install Script (Recommended for Linux/macOS)
+
+Install the `concord` binary directly into `/usr/local/bin` with a single command (similar to `etcd` or `helm`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Faithful001/concord/main/install.sh | sh
+```
+
+### Option 2: via `go install`
+
+If you have Go installed, install `concord` directly to your `$GOPATH/bin`:
+
+```bash
+go install github.com/Faithful001/concord.git/cmd/concord@latest
+```
+
 ---
 
 ## Quick start
 
-### Option 1: Docker Compose (recommended)
+### Option 1: Docker Compose
 
 ```bash
 git clone https://github.com/Faithful001/concord.git
@@ -433,7 +451,7 @@ A few choices worth explaining, since they weren't the only options:
 
 - [ ] Design and document a clean, stable public API surface for embedding (constructing a node, wiring a custom transport, registering a custom FSM)
 - [ ] Ensure internal packages that need to be embeddable move out of `internal/` into an importable location, e.g. `pkg/` or a top-level package
-- [ ] Snapshotting and log compaction (so the log doesn't grow forever)
+- [x] Snapshotting and log compaction (so the log doesn't grow forever)
 - [ ] Cluster membership changes (adding/removing nodes while running)
 - [ ] Switching `net/rpc` for gRPC (cross-language compatibility, better tooling)
 - [ ] Read-only replica support / linearizable read optimizations

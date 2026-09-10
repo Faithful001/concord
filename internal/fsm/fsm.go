@@ -27,6 +27,17 @@ func (f *FSM) Store() *storage.Store {
 	return f.store
 }
 
+// Snapshot captures the state of the underlying key-value store.
+func (f *FSM) Snapshot() map[string][]byte {
+	return f.store.Snapshot()
+}
+
+// Restore resets the state of the underlying key-value store.
+func (f *FSM) Restore(data map[string][]byte) {
+	f.store.Restore(data)
+}
+
+
 // Run reads ApplyMsgs from applyCh and applies each one.
 // It returns when applyCh is closed or drained on shutdown.
 func (f *FSM) Run(applyCh <-chan raft.ApplyMsg) {

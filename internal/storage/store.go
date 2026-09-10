@@ -49,3 +49,30 @@ func (s *Store) Delete(key string) error {
 	delete(s.data, key)
 	return nil
 }
+
+// Snapshot returns a deep copy of the store's current key-value data.
+func (s *Store) Snapshot() map[string][]byte {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	cp := make(map[string][]byte, len(s.data))
+	for k, v := range s.data {
+		valCopy := make([]byte, len(v))
+		copy(valCopy, v)
+		cp[k] = valCopy
+	}
+	return cp
+}
+
+// Restore resets the store's state with the provided data.
+func (s *Store) Restore(data map[string][]byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.data = make(map[string][]byte, len(data))
+	for k, v := range data {
+		valCopy := make([]byte, len(v))
+		copy(valCopy, v)
+		s.data[k] = valCopy
+	}
+}

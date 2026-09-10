@@ -10,31 +10,41 @@ import (
 
 // Snapshot is the serialisable form of a node's persistent Raft state.
 type Snapshot struct {
-	CurrentTerm int             `json:"current_term"`
-	VotedFor    string          `json:"voted_for"`
-	Log         []raft.LogEntry `json:"log"`
-	CommitIndex int             `json:"commit_index"`
+	CurrentTerm       int               `json:"current_term"`
+	VotedFor          string            `json:"voted_for"`
+	LastIncludedIndex int               `json:"last_included_index"`
+	LastIncludedTerm  int               `json:"last_included_term"`
+	Log               []raft.LogEntry   `json:"log"`
+	CommitIndex       int               `json:"commit_index"`
+	Data              map[string][]byte `json:"data,omitempty"`
 }
 
 // FromSnapshotState converts a raft.SnapshotState to a Snapshot ready for Save.
 func FromSnapshotState(s raft.SnapshotState) Snapshot {
 	return Snapshot{
-		CurrentTerm: s.CurrentTerm,
-		VotedFor:    s.VotedFor,
-		Log:         s.Log,
-		CommitIndex: s.CommitIndex,
+		CurrentTerm:       s.CurrentTerm,
+		VotedFor:          s.VotedFor,
+		LastIncludedIndex: s.LastIncludedIndex,
+		LastIncludedTerm:  s.LastIncludedTerm,
+		Log:               s.Log,
+		CommitIndex:       s.CommitIndex,
+		Data:              s.Data,
 	}
 }
 
 // ToSnapshotState converts the loaded Snapshot back to a raft.SnapshotState.
 func (s Snapshot) ToSnapshotState() raft.SnapshotState {
 	return raft.SnapshotState{
-		CurrentTerm: s.CurrentTerm,
-		VotedFor:    s.VotedFor,
-		Log:         s.Log,
-		CommitIndex: s.CommitIndex,
+		CurrentTerm:       s.CurrentTerm,
+		VotedFor:          s.VotedFor,
+		LastIncludedIndex: s.LastIncludedIndex,
+		LastIncludedTerm:  s.LastIncludedTerm,
+		Log:               s.Log,
+		CommitIndex:       s.CommitIndex,
+		Data:              s.Data,
 	}
 }
+
 
 // Save atomically writes a snapshot to <dataDir>/<nodeID>.snap using a temp file
 // + rename to avoid a torn write on crash.
